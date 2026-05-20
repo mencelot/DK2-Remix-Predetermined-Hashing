@@ -2964,6 +2964,11 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 			}
 			const float denom = (uiHeuristicMaxRHW > 0.0f) ? uiHeuristicMaxRHW : 1.0f;
 			isUIPassthrough = ((uiHeuristicMaxRHW - uiHeuristicMinRHW) / denom) < 1e-4f;
+			// [may20-minus-mip] DISABLED: the UI-passthrough heuristic classified
+			// constant-RHW torch billboards as UI -> they skipped the world inverse
+			// projection -> torches vanish by angle/distance under Remix. OG (pre-May-2)
+			// projected ALL XYZRHW draws. Force false to restore that baseline.
+			isUIPassthrough = false;
 
 			// === Phase A.8 (atlas decomposition prep): UV bounds for stage 0 ===
 			// Each drawcall samples a sub-rectangle of the bound atlas. Aggregating
@@ -3205,6 +3210,11 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 			}
 			const float denom = (uiHeuristicMaxRHW > 0.0f) ? uiHeuristicMaxRHW : 1.0f;
 			isUIPassthrough = ((uiHeuristicMaxRHW - uiHeuristicMinRHW) / denom) < 1e-4f;
+			// [may20-minus-mip] DISABLED: the UI-passthrough heuristic classified
+			// constant-RHW torch billboards as UI -> they skipped the world inverse
+			// projection -> torches vanish by angle/distance under Remix. OG (pre-May-2)
+			// projected ALL XYZRHW draws. Force false to restore that baseline.
+			isUIPassthrough = false;
 
 			// Phase A.8: same UV-bounds scan as DrawPrimitive site (see comment there)
 			float u_min = 0, u_max = 0, v_min = 0, v_max = 0;

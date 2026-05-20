@@ -8397,16 +8397,12 @@ HRESULT m_IDirectDrawSurfaceX::CopyToDrawTexture(LPRECT lpDestRect)
 		CaptureSurfaceContent(DestSurface.Get(), this);
 	}
 
-	// Regenerate mip chain from the freshly-copied mip 0. Without this, mips
-	// 1..N retain whatever uninitialized data CreateTexture left in them --
-	// visible as white squares inside DK2 torches when the GPU samples lower
-	// LODs (camera zoomed out / far-away torches). Only relevant when AutoGen
-	// is off (we do the work the driver would otherwise do) and the texture
-	// has more than one level.
-	if (!IsMipMapAutogen() && surface.DrawTexture->GetLevelCount() > 1)
-	{
-		D3DXFilterTexture(surface.DrawTexture, nullptr, 0, D3DX_FILTER_BOX);
-	}
+	// [may20-minus-mip] REMOVED the unconditional D3DXFilterTexture(D3DX_FILTER_BOX)
+	// mip regeneration added 2026-05-18. It box-filters the lower mips of every
+	// multi-mip draw texture on every copy; on animated torch surfaces this
+	// corrupts the lower LODs -> torches disappear by distance/angle. This is the
+	// suspected disappearing-torch regression; everything else in the working
+	// May-20 build (RTX camera path, A.10) is preserved.
 
 	surface.IsDrawTextureDirty = false;
 
