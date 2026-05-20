@@ -79,6 +79,10 @@ inline std::ostream& operator<<(std::ostream& os, const DHEX& dhex) {
 	visit(DdrawConvertHomogeneousToWorldNearPlane) \
 	visit(DdrawConvertHomogeneousToWorldFarPlane) \
 	visit(DdrawConvertHomogeneousToWorldDepthOffset) \
+	visit(DdrawLogTextureAtlas) \
+	visit(DdrawContentCapture) \
+	visit(DdrawCollapseAnimationPools) \
+	visit(DdrawAtlasDecompose) \
 	visit(DdrawUseDirect3D9Caps) \
 	visit(DdrawUseShadowSurface) \
 	visit(DdrawUseNativeResolution) \
@@ -286,6 +290,10 @@ struct CONFIG
 	float DdrawConvertHomogeneousToWorldNearPlane = 0.0f;		// The near plane of the camera used to reconstruct the original 3D world.
 	float DdrawConvertHomogeneousToWorldFarPlane = 0.0f;		// The far plane of the camera used to reconstruct the original 3D world.
 	float DdrawConvertHomogeneousToWorldDepthOffset = 0.0f;		// The offset to add to the geometry so it does not clip into the near plane.
+	bool DdrawLogTextureAtlas = false;			// Log texture atlas blit operations for RTX Remix analysis
+	bool DdrawContentCapture = false;			// Phase A.7: dump unique texture content as PNGs under <gamedir>\_capture_phase_a7\ with a manifest CSV
+	bool DdrawCollapseAnimationPools = false;	// Path B: detect per-instance animation pools (one source -> N dests) and redirect SetTexture to a canonical member to stabilize hashes for Remix replacement
+	bool DdrawAtlasDecompose = false;			// Phase A.10: split known k-in-1 atlases into per-region sub-textures at SetTexture time and rewrite drawcall UVs to [0,1] so Remix sees per-region content hashes
 	bool DdrawNoDrawBufferSysLock = false;		// Disables Draw CriticalSection and sets NOSYSLOCK on Index and Vertex Buffer locks
 	bool DdrawNoMultiThreaded = false;			// Don't add D3DCREATE_MULTITHREADED flag when creating Direct3D9 device unless the game requests it
 	bool DdrawUseDirect3D9Caps = false;			// Use Direct3D9 (Dd7to9) for GetCaps

@@ -17,7 +17,19 @@
 #include "winmm.h"
 #include "ddraw.h"
 #include <fstream>
+#include <intrin.h>
+#include <unordered_set>
+#include <filesystem>
 #include "Utils\Utils.h"
+// xxHash single-header (dxvk-remix's exact copy). XXH_INLINE_ALL pulls in the
+// full implementation as static functions in this translation unit. We use
+// XXH3_64bits over tightly-packed mip-0 bytes to reproduce Remix's texture
+// content hash byte-exactly -- see dxvk-remix d3d9_common_texture.cpp
+// SetupForRtxFrom(): imageHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size).
+// Matching it means our captured content hashes equal Remix capture filenames
+// + community PBR mod filenames, so replacements drop in by hash name.
+#define XXH_INLINE_ALL
+#include "External\xxhash\xxhash.h"
 
 namespace {
 	constexpr DWORD ExtraHeightPadding = 4;
@@ -34,6 +46,458 @@ namespace {
 	// Used for sharing emulated memory
 	bool ShareEmulatedMemory = false;
 	std::vector<EMUSURFACE*> memorySurfaces;
+
+	// Lock/Unlock tracking for RTX Remix texture atlas analysis
+	struct LockInfo {
+		void* surface;
+		DWORD width;
+		DWORD height;
+		DWORD flags;
+		bool isWriteLock;
+	};
+
+	struct SurfaceLockStats {
+		DWORD lockCount = 0;
+		DWORD writeLockCount = 0;
+		DWORD width = 0;
+		DWORD height = 0;
+		std::vector<LockInfo> recentLocks;
+	};
+
+	std::unordered_map<void*, SurfaceLockStats> lockTrackingMap;
+	DWORD lockTrackingFrame = 0;
+
+	// --- Surface-pool tracking (Phase A: torch-flicker investigation, 2026-05-15) ---
+	// Tests whether DK2 thrashes a fixed-size texture-surface pool as visible
+	// content (torches/water) rises. Gated on Config.DdrawLogTextureAtlas.
+	// Single render thread => no locking, matching the lockTrackingMap style above.
+	struct SurfacePoolStats {
+		LONG  liveTextureSurfaces = 0;     // current count of live DDSCAPS_TEXTURE surfaces
+		LONG  peakTextureSurfaces = 0;     // session high-water mark
+		DWORD createdThisWindow = 0;       // creations since last 60-frame dump
+		DWORD releasedThisWindow = 0;      // destructions since last 60-frame dump
+		DWORD bltToTextureThisWindow = 0;  // Blts whose destination is a texture surface
+	};
+	SurfacePoolStats poolStats;
+	std::unordered_map<void*, char> trackedTextureSurfaces;  // surfaces counted as textures
+	std::unordered_map<DWORD, DWORD> createCallerHist;       // DKII.exe return addr -> count
+
+	// Phase A.6 (2026-05-18): per-destination Blt attribution. Tests whether the
+	// baseline 4-26 bltToTex/window in steady state is concentrated on a small
+	// set of "live" surfaces (= candidate torch/animated frames) or spread thin.
+	struct BltDestInfo {
+		DWORD count = 0;
+		DWORD width = 0;
+		DWORD height = 0;
+		void* lastSrc = nullptr;
+	};
+	std::unordered_map<void*, BltDestInfo> bltTargetsThisWindow;
+
+	// Path B (2026-05-18 evening): animation-pool collapse.
+	// Phase A.7 determinism test proved one logical torch produces ~11 distinct
+	// hashes per session and zero overlap across sessions. The mechanism is:
+	// the engine maintains a pool of per-instance surfaces all blt'd from one
+	// shared source. We detect a pool when one source's distinct-destination
+	// count >= POOL_DETECT_THRESHOLD, then redirect SetTexture binds of the
+	// non-canonical members to the first-seen (canonical) member.
+	constexpr size_t POOL_DETECT_THRESHOLD = 5;  // tune: 11 torches => 5 is well below
+	struct AnimPoolInfo {
+		void* canonical = nullptr;                       // first dest seen (typed as m_IDirectDrawSurfaceX*)
+		std::unordered_set<void*> members;               // all dests fed from this src
+	};
+	std::unordered_map<LPDIRECTDRAWSURFACE7, AnimPoolInfo> poolBySource;
+	std::unordered_map<void*, void*> memberToCanonical; // dest_wrapper -> canonical_wrapper for fast SetTexture lookup
+	// Per-dest blt count -- gate redirection to dests that have been re-written
+	// >= 2 times (= dynamic content) so we don't collapse static terrain pools
+	// where each tile is written once at load.
+	std::unordered_map<void*, DWORD> destBltCount;
+	DWORD poolRedirectsTotal = 0;
+	DWORD poolsActiveTotal = 0;
+
+	// --- Phase A.10 (2026-05-18): atlas decomposition ---
+	// For known REAL_K_IN_1 atlases (identified offline by L2-fingerprint clustering
+	// of per-drawcall UV regions, per dk2_phase_a8_atlas_decomp memory), synthesize
+	// one d3d9 sub-texture per region and bind it instead of the source atlas. The
+	// drawcall's vertex UVs are rewritten to [0,1] over the sub-texture so Remix
+	// observes a distinct content hash per region, enabling per-region replacements.
+	//
+	// Atlas identity is keyed by content hash (via firstHashByTex), NOT wrapper
+	// pointer -- pointers don't survive session restarts.
+	struct UVRect { float u0, v0, u1, v1; };
+	// Content-hash-keyed decomposition (fast path -- O(1) lookup, exact match).
+	// Works only for atlases whose surface bytes are deterministic across
+	// sessions. Pool atlases (one source Blt'd into N per-instance surfaces)
+	// drift byte-wise per session and need visual-fingerprint matching
+	// (see kAtlasFamilies below) instead.
+	const std::unordered_map<uint64_t, std::vector<UVRect>> kAtlasRegions = {
+		// Wrapper 0EAC13C8 in original session, 0EC25428/0EC0BFD0/0EC2D180/0EC35978
+		// in later runs (pointer shifts, content hash is stable). Torch flame +
+		// cyan shapes + stone wall + HUD ("1" badge + segmented ring).
+		// Cross-session stability: 8/13 manifests on disk.
+		// Verified end-to-end across 3 sessions 2026-05-18 (3 sub-textures
+		// synthesized each time, cropped content matches expected quadrants).
+		{ 0x6FBA7910BBB20D7DULL, {
+			{ 0.50f, 0.75f, 0.75f, 1.00f },   // bottom-left of BR quadrant: "1" badge
+			{ 0.75f, 0.75f, 1.00f, 1.00f },   // bottom-right of BR quadrant: segmented ring
+			{ 0.50f, 0.00f, 1.00f, 0.50f },   // TR half-quadrant: cyan/white shapes
+		} },
+		// Character portrait atlas (2 dwarf-like heads visible, plus top strip).
+		// Cross-session stability: 12/13 manifests on disk -- the MOST stable
+		// REAL_K_IN_1 atlas. Fresh-session classifier output 2026-05-18 21:46
+		// produced these two non-nested regions (R0 has unique [0.65,1.0]
+		// u-range, R1 has unique [0,0.05] u-range -- engine samples both
+		// distinctly).
+		{ 0x6E3141D82ABA1AEDULL, {
+			{ 0.05f, 0.00f, 1.00f, 1.00f },   // whole atlas minus left sliver (428 draws)
+			{ 0.00f, 0.25f, 0.65f, 0.95f },   // mid-left rect (191 draws)
+		} },
+	};
+
+	// Synthesized sub-textures cached per (atlas wrapper ptr, region idx). Keyed by
+	// wrapper because two surfaces sharing a content hash still have independent
+	// d3d9 source textures and we want to crop from the actual bound one.
+	struct SubTexKey {
+		void* atlasWrapper;
+		int regionIdx;
+		bool operator==(const SubTexKey& o) const { return atlasWrapper == o.atlasWrapper && regionIdx == o.regionIdx; }
+	};
+	struct SubTexKeyHash { size_t operator()(const SubTexKey& k) const { return std::hash<void*>()(k.atlasWrapper) ^ ((size_t)k.regionIdx * 0x9E3779B97F4A7C15ULL); } };
+	std::unordered_map<SubTexKey, IDirect3DTexture9*, SubTexKeyHash> subTextureCache;
+	DWORD atlasDecomposeBindsTotal = 0;
+
+	// --- Visual fingerprint matching (fallback for pool atlases) ---
+	// Same UVRect type as above. Family table includes a 32x32 grayscale
+	// fingerprint + sorted-smallest-first region list. At first bind of an
+	// unknown atlas, runtime computes the bound surface's fingerprint via
+	// D3DXLoadSurfaceFromSurface scale-to-32x32 + LockRect readback, then
+	// L2-distance-matches against family fingerprints. Match decision is
+	// cached per wrapper so subsequent binds are free.
+#include "AtlasFingerprints.inc"
+
+	// Per-wrapper fingerprint-match cache:
+	//   -2 = never computed
+	//   -1 = computed, no family matched (do not decompose)
+	//  >=0 = matched family index in kAtlasFamilies
+	constexpr int FP_NEVER_COMPUTED = -2;
+	constexpr int FP_NO_MATCH = -1;
+	std::unordered_map<void*, int> wrapperToFamilyIdx;
+	DWORD fingerprintComputeTotal = 0;
+	DWORD fingerprintMatchTotal = 0;
+
+	// --- Path C: canonical sub-texture by (family, region) ---
+	// Once a fingerprint-matched atlas synthesizes a sub-texture for region R,
+	// store that d3d9 texture as the canonical for (family_idx, R). Subsequent
+	// pool variants matching the same family+region bind THE SAME canonical
+	// d3d9 texture instead of synthesizing their own copies. Remix then sees
+	// ONE hash per (family, region) regardless of how many pool variants the
+	// game spawned, so a single mod replacement covers them all.
+	//
+	// Key packs family_idx (int32) high, region_idx (int32) low. Negative
+	// family_idx is impossible here since we only insert on positive match.
+	std::unordered_map<uint64_t, IDirect3DTexture9*> canonicalByFamilyRegion;
+	DWORD pathCRedirectsTotal = 0;
+	DWORD pathCCanonicalsCreated = 0;
+
+	inline uint64_t MakeFamilyRegionKey(int familyIdx, int regionIdx)
+	{
+		return ((uint64_t)(uint32_t)familyIdx << 32) | (uint64_t)(uint32_t)regionIdx;
+	}
+
+	// Compute 32x32 grayscale fingerprint by scaling source surface to a
+	// 32x32 A8R8G8B8 system-memory target, then luma-converting per pixel.
+	// Returns false on any d3d9 error.
+	bool ComputeFingerprintFromTexture(IDirect3DTexture9* srcTexture, LPDIRECT3DDEVICE9* d3d9Device, uint8_t outFp[1024])
+	{
+		if (!srcTexture || !d3d9Device || !*d3d9Device) return false;
+		IDirect3DSurface9* srcLevel = nullptr;
+		if (FAILED(srcTexture->GetSurfaceLevel(0, &srcLevel)) || !srcLevel) return false;
+		IDirect3DSurface9* tmp = nullptr;
+		HRESULT hr = (*d3d9Device)->CreateOffscreenPlainSurface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &tmp, nullptr);
+		if (FAILED(hr) || !tmp) { srcLevel->Release(); return false; }
+		hr = D3DXLoadSurfaceFromSurface(tmp, nullptr, nullptr, srcLevel, nullptr, nullptr, D3DX_FILTER_LINEAR, 0);
+		srcLevel->Release();
+		if (FAILED(hr)) { tmp->Release(); return false; }
+		D3DLOCKED_RECT lr = {};
+		if (FAILED(tmp->LockRect(&lr, nullptr, D3DLOCK_READONLY))) { tmp->Release(); return false; }
+		// A8R8G8B8 in memory is byte order BGRA. ITU-R BT.601 luma.
+		for (int y = 0; y < 32; y++)
+		{
+			const uint8_t* row = (const uint8_t*)lr.pBits + y * lr.Pitch;
+			for (int x = 0; x < 32; x++)
+			{
+				uint8_t b = row[x*4 + 0];
+				uint8_t g = row[x*4 + 1];
+				uint8_t r = row[x*4 + 2];
+				outFp[y*32 + x] = (uint8_t)((r*299 + g*587 + b*114) / 1000);
+			}
+		}
+		tmp->UnlockRect();
+		tmp->Release();
+		fingerprintComputeTotal++;
+		return true;
+	}
+
+	// L2 distance between two 1024-byte fingerprints (sqrt of sum of squared diffs).
+	float FingerprintL2(const uint8_t a[1024], const uint8_t b[1024])
+	{
+		uint64_t sum = 0;
+		for (int i = 0; i < 1024; i++)
+		{
+			int d = (int)a[i] - (int)b[i];
+			sum += (uint64_t)(d * d);
+		}
+		return sqrtf((float)sum);
+	}
+
+	// Find the best family match for a fingerprint. Returns family index or -1.
+	int FindFamilyForFingerprint(const uint8_t fp[1024], float* outBestL2 = nullptr)
+	{
+		const size_t numFamilies = sizeof(kAtlasFamilies) / sizeof(kAtlasFamilies[0]);
+		int bestIdx = -1;
+		float bestL2 = 1e30f;
+		for (size_t i = 0; i < numFamilies; i++)
+		{
+			float d = FingerprintL2(fp, kAtlasFamilies[i].fp);
+			if (d < bestL2) { bestL2 = d; bestIdx = (int)i; }
+		}
+		if (outBestL2) *outBestL2 = bestL2;
+		return (bestL2 < kFingerprintL2Threshold) ? bestIdx : -1;
+	}
+
+	// UV match: drawcall UV bounds (u_min,v_min,u_max,v_max) contained within
+	// region's rectangle with a small slack (UV jitter from rasterizer rounding).
+	bool UVRectContains(const UVRect& r, float u_min, float v_min, float u_max, float v_max)
+	{
+		constexpr float SLACK = 0.02f;
+		return u_min >= r.u0 - SLACK && u_max <= r.u1 + SLACK
+			&& v_min >= r.v0 - SLACK && v_max <= r.v1 + SLACK;
+	}
+
+	// Phase A.7 (2026-05-18): continuous content capture.
+	// Hook fires inside CopyToDrawTexture immediately after D3DXLoadSurfaceFromSurface
+	// lands fresh content in surface.DrawTexture (the layer Remix's bridge sees on
+	// upload, per dk2_hash_mapping memory). For each new content-hash this session,
+	// dump the bytes as a PNG into <gamedir>\_capture_phase_a7\<hash>.png and
+	// append a manifest CSV row. Run over a full play session to enumerate every
+	// unique texture content the game produces -- the post-processing step then
+	// maps each captured PNG to a PBRify replacement via the existing L2 visual
+	// fingerprint workflow.
+	//
+	// Hash is XXH3_64bits over tightly-packed mip-0 bytes (2026-05-20), byte-exact
+	// match to dxvk-remix. PNG filenames + TEX_HASH log values therefore EQUAL
+	// Remix capture filenames and community PBR mod filenames -- replacements drop
+	// in by hash name with no manual correlation. (Was FNV-1a until the xxhash.h
+	// integration; FNV was session-dedup only and Remix-incompatible.)
+	struct ContentCaptureState {
+		bool initialized = false;
+		std::string captureDir;
+		std::ofstream manifest;
+		std::unordered_set<uint64_t> seenHashes;
+		// Phase A.7 v2 (2026-05-18): per-surface "first bind seen" dedup so the
+		// bind-time hook in IDirect3DDeviceX::SetTexture only captures each
+		// surface once -- the SetDirtyFlag hook handles subsequent content
+		// changes via content-hash dedup.
+		std::unordered_set<void*> firstBindSeen;
+		// Phase A.7 v3 (2026-05-18 eve): map from d3d9 texture pointer to its
+		// first-observed content hash. Logged once per (d3d9_ptr) so offline
+		// analysis can cross-reference draw-log tex= entries to capture PNGs.
+		std::unordered_map<void*, uint64_t> firstHashByTex;
+		DWORD bltSeenTotal = 0;
+		DWORD bindSeenTotal = 0;
+		DWORD savedTotal = 0;
+	};
+	ContentCaptureState capState;
+
+	// Remix-compatible content hash: XXH3_64bits over tightly-packed bytes.
+	// Matches dxvk-remix exactly so our hashes equal Remix capture filenames.
+	uint64_t ComputeContentHash(const void* data, size_t size)
+	{
+		return static_cast<uint64_t>(XXH3_64bits(data, size));
+	}
+
+	void EnsureContentCaptureInit()
+	{
+		if (capState.initialized) return;
+		capState.initialized = true;
+		char modulePath[MAX_PATH] = {};
+		GetModuleFileNameA(nullptr, modulePath, MAX_PATH);
+		std::string gameDir = modulePath;
+		auto slash = gameDir.find_last_of("\\/");
+		if (slash != std::string::npos) gameDir = gameDir.substr(0, slash);
+		// Phase A.7 v2: per-run timestamped dir so multiple runs don't clobber
+		// each other -- enables determinism testing (compare PNG sets across runs).
+		SYSTEMTIME st;
+		GetLocalTime(&st);
+		char ts[32];
+		sprintf_s(ts, sizeof(ts), "_v2_%04d%02d%02d_%02d%02d%02d",
+			st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+		capState.captureDir = gameDir + "\\_capture_phase_a7" + ts;
+		std::error_code ec;
+		std::filesystem::create_directories(capState.captureDir, ec);
+		std::string manifestPath = capState.captureDir + "\\manifest.csv";
+		capState.manifest.open(manifestPath, std::ios::out | std::ios::app);
+		if (capState.manifest.is_open())
+		{
+			capState.manifest << "hash,width,height,format,bltSeenTotal\n";
+			capState.manifest.flush();
+		}
+		Logging::Log() << "[A.7] content capture initialized -> " << capState.captureDir.c_str();
+	}
+
+	// Hash dest surface mip-0 bytes (skipping pitch padding so the hash is independent
+	// of allocation alignment). If new, dump PNG via D3DXSaveSurfaceToFileInMemory.
+	// `originatingTex` (optional): the d3d9 texture this surface came from --
+	// when supplied AND we've never seen this texture before, emit a TEX_HASH
+	// log line so offline analysis can join draw-log `tex=` entries to PNG files.
+	void CaptureSurfaceContent(IDirect3DSurface9* destSurface, void* originatingTex = nullptr)
+	{
+		if (!destSurface) return;
+		EnsureContentCaptureInit();
+		capState.bltSeenTotal++;
+		D3DSURFACE_DESC desc = {};
+		if (FAILED(destSurface->GetDesc(&desc))) return;
+		D3DLOCKED_RECT lr = {};
+		if (FAILED(destSurface->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return;
+		// Hash row-by-row to skip allocator pitch padding. Bytes-per-pixel must
+		// come from the surface format -- DK2's per-instance textures land in
+		// A4R4G4B4 (2 bpp), NOT A8R8G8B8 (4 bpp). Earlier v1/v2 captures used
+		// a hardcoded width*4 which read 16 KB of uninitialized garbage past
+		// every A4R4G4B4 texel buffer, producing non-deterministic hashes that
+		// varied per run (hashes had zero overlap across two runs of the same
+		// scene). With the correct bpp the hash is fully deterministic.
+		const DWORD bpp = GetBitCount(desc.Format) / 8;
+		if (bpp == 0) { destSurface->UnlockRect(); return; }
+		// XXH3_64bits over tightly-packed mip-0 bytes -- byte-exact match to
+		// dxvk-remix's imageHash = XXH3_64bits(stagingBuffer, size). DXVK stages
+		// the upload tightly packed (no row padding), so we feed each row's
+		// width*bpp bytes via the streaming API, skipping the driver's lr.Pitch
+		// padding. The streaming digest equals a one-shot over the concatenation.
+		// rowBytes uses the real bpp (DK2 per-instance textures are A4R4G4B4 = 2bpp,
+		// not 4) so we don't hash uninitialized padding -> deterministic + matches Remix.
+		uint64_t h = 0;
+		const UINT rowBytes = desc.Width * bpp;
+		XXH3_state_t* xstate = XXH3_createState();
+		if (xstate)
+		{
+			XXH3_64bits_reset(xstate);
+			const uint8_t* base = static_cast<const uint8_t*>(lr.pBits);
+			for (UINT y = 0; y < desc.Height; ++y)
+			{
+				const uint8_t* row = base + static_cast<size_t>(y) * lr.Pitch;
+				UINT bytesThisRow = rowBytes;
+				if (bytesThisRow > static_cast<UINT>(lr.Pitch)) bytesThisRow = static_cast<UINT>(lr.Pitch);
+				XXH3_64bits_update(xstate, row, bytesThisRow);
+			}
+			h = static_cast<uint64_t>(XXH3_64bits_digest(xstate));
+			XXH3_freeState(xstate);
+		}
+		destSurface->UnlockRect();
+		// Emit TEX_HASH mapping once per (d3d9 texture pointer) so offline
+		// tooling can resolve draw-log tex= entries to a representative PNG.
+		if (originatingTex && capState.firstHashByTex.find(originatingTex) == capState.firstHashByTex.end())
+		{
+			capState.firstHashByTex[originatingTex] = h;
+			char buf[96];
+			sprintf_s(buf, sizeof(buf), "TEX_HASH d3d9=%p hash=%016llX", originatingTex, (unsigned long long)h);
+			Logging::Log() << buf;
+		}
+		if (!capState.seenHashes.insert(h).second) return; // already saved this session
+		// New hash -- save PNG
+		LPD3DXBUFFER pBuffer = nullptr;
+		if (SUCCEEDED(D3DXSaveSurfaceToFileInMemory(&pBuffer, D3DXIFF_PNG, destSurface, nullptr, nullptr)) && pBuffer)
+		{
+			char pngPath[MAX_PATH];
+			sprintf_s(pngPath, sizeof(pngPath), "%s\\%016llX.png", capState.captureDir.c_str(), (unsigned long long)h);
+			HANDLE fh = CreateFileA(pngPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (fh != INVALID_HANDLE_VALUE)
+			{
+				DWORD written = 0;
+				if (WriteFile(fh, pBuffer->GetBufferPointer(), (DWORD)pBuffer->GetBufferSize(), &written, nullptr))
+				{
+					capState.savedTotal++;
+				}
+				CloseHandle(fh);
+			}
+			pBuffer->Release();
+		}
+		if (capState.manifest.is_open())
+		{
+			char buf[128];
+			sprintf_s(buf, sizeof(buf), "%016llX,%u,%u,%u,%u\n",
+				(unsigned long long)h, desc.Width, desc.Height, (UINT)desc.Format, capState.bltSeenTotal);
+			capState.manifest << buf;
+			if ((capState.savedTotal & 0x0F) == 0) capState.manifest.flush();
+		}
+	}
+
+	// Phase A.7 v2 entry point invoked from IDirect3DDeviceX::SetTexture for each
+	// texture about to be bound for drawing. Captures content of static textures
+	// that never trigger SetDirtyFlag (loaded once at init, never modified).
+	// One-shot per surface pointer -- the SetDirtyFlag hook re-captures on changes.
+	void CaptureSurfaceForPhaseA7FirstBind(IDirect3DTexture9* texture, void* wrapperPtr)
+	{
+		if (!Config.DdrawContentCapture || !texture) return;
+		if (!capState.firstBindSeen.insert(texture).second) return;
+		capState.bindSeenTotal++;
+		IDirect3DSurface9* level0 = nullptr;
+		if (FAILED(texture->GetSurfaceLevel(0, &level0)) || !level0) return;
+		// Pass wrapper pointer so TEX_HASH log uses same key as DRAW_XYZRHW tex=
+		CaptureSurfaceContent(level0, wrapperPtr);
+		level0->Release();
+	}
+
+	// DKII.exe (main module) address range, resolved once.
+	uintptr_t gameModBase = 0, gameModEnd = 0;
+	void EnsureGameModuleBounds()
+	{
+		if (gameModEnd)
+		{
+			return;
+		}
+		HMODULE h = GetModuleHandleW(nullptr);
+		if (!h)
+		{
+			return;
+		}
+		IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)h;
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+		{
+			return;
+		}
+		IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)h + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE)
+		{
+			return;
+		}
+		gameModBase = (uintptr_t)h;
+		gameModEnd = gameModBase + nt->OptionalHeader.SizeOfImage;
+	}
+
+	// Scan the raw stack upward for the first return address that lands inside
+	// DKII.exe and is immediately preceded by a relative CALL (0xE8). That is the
+	// game-side call site that asked for this surface -- the bridge into Phase B.
+	DWORD FindGameCaller()
+	{
+		EnsureGameModuleBounds();
+		if (!gameModEnd)
+		{
+			return 0;
+		}
+		uintptr_t* sp = (uintptr_t*)_AddressOfReturnAddress();
+		for (int i = 0; i < 256; i++)
+		{
+			uintptr_t v = sp[i];
+			if (v <= gameModBase + 0x1000 || v >= gameModEnd)
+			{
+				continue;
+			}
+			if (*(BYTE*)(v - 5) == 0xE8)	// rel32 CALL
+			{
+				return (DWORD)v;
+			}
+		}
+		return 0;
+	}
 }
 
 // ******************************
@@ -428,6 +892,65 @@ HRESULT m_IDirectDrawSurfaceX::Blt(LPRECT lpDestRect, LPDIRECTDRAWSURFACE7 lpDDS
 		" BltFX = " << lpDDBltFx <<
 		" MipMapLevel = " << MipMapLevel <<
 		" PresentBlt = " << PresentBlt;
+
+	// Surface-pool tracking (Phase A): count Blts whose destination is a texture
+	// surface -- tests the "content churned into persistent surfaces" hypothesis.
+	if (Config.DdrawLogTextureAtlas && IsSurfaceTexture())
+	{
+		poolStats.bltToTextureThisWindow++;
+		// Phase A.6: per-destination attribution
+		auto& info = bltTargetsThisWindow[this];
+		info.count++;
+		info.width = GetWidth();
+		info.height = GetHeight();
+		info.lastSrc = lpDDSrcSurface;
+	}
+
+	// Path B: animation-pool collapse detection + cycling canonical.
+	// Detect: once a source has fed >=POOL_DETECT_THRESHOLD distinct dests,
+	// it is a pool. Dynamic gate: only redirect dests with bltCount >= 2 so
+	// static terrain pools (write-once-at-load) are excluded. Cycling canonical:
+	// the just-written dest becomes the canonical; previous canonical joins
+	// the redirect map. Net effect: animation continues at engine rate but
+	// all visible pool instances bind the SAME current frame each draw call,
+	// producing one stable hash sequence Remix can map to a replacement.
+	if (Config.DdrawCollapseAnimationPools && IsSurfaceTexture() && lpDDSrcSurface)
+	{
+		const DWORD newCount = ++destBltCount[this];
+		auto& pool = poolBySource[lpDDSrcSurface];
+		const bool wasUnderThreshold = pool.members.size() < POOL_DETECT_THRESHOLD;
+		pool.members.insert(this);
+
+		if (pool.members.size() >= POOL_DETECT_THRESHOLD && newCount >= 2)
+		{
+			// This is a re-write to an animated dest in an active pool.
+			// Promote `this` to canonical; redirect all other re-written members.
+			void* prevCanonical = pool.canonical;
+			pool.canonical = this;
+			memberToCanonical.erase(this);  // new canonical doesn't redirect
+			for (void* m : pool.members)
+			{
+				if (m != pool.canonical && destBltCount[m] >= 2)
+				{
+					memberToCanonical[m] = pool.canonical;
+				}
+			}
+			if (prevCanonical == nullptr)
+			{
+				poolsActiveTotal++;
+				Logging::Log() << "[PathB] pool ACTIVATED src=" << lpDDSrcSurface
+					<< " canonical=" << pool.canonical
+					<< " poolSize=" << pool.members.size();
+			}
+		}
+		else if (wasUnderThreshold && pool.members.size() >= POOL_DETECT_THRESHOLD)
+		{
+			// Pool just hit threshold but this dest is still a singleton write
+			// (count==1, so likely static-load member of a pool that's about to
+			// also see dynamic members). Don't activate yet; wait for a dynamic
+			// member to write twice.
+		}
+	}
 
 	// Check if source Surface exists
 	if (lpDDSrcSurface && !ProxyAddressLookupTable.CheckSurfaceExists(lpDDSrcSurface))
@@ -2604,6 +3127,22 @@ HRESULT m_IDirectDrawSurfaceX::Lock2(LPRECT lpDestRect, LPDDSURFACEDESC2 lpDDSur
 			" Timing = " << Logging::GetTimeLapseInMS(startTime);
 #endif
 
+		// Track Lock operations for atlas detection
+		if (Config.DdrawLogTextureAtlas && SUCCEEDED(hr))
+		{
+			SurfaceLockStats& stats = lockTrackingMap[this];
+			stats.lockCount++;
+			stats.width = surfaceDesc2.dwWidth;
+			stats.height = surfaceDesc2.dwHeight;
+
+			// Check if this is a write lock (not read-only)
+			bool isWriteLock = !(dwFlags & DDLOCK_READONLY);
+			if (isWriteLock)
+			{
+				stats.writeLockCount++;
+			}
+		}
+
 		return hr;
 	}
 
@@ -3823,11 +4362,41 @@ void m_IDirectDrawSurfaceX::InitInterface(DWORD DirectXVersion)
 
 		// Update surface description and create backbuffers
 		InitSurfaceDesc(DirectXVersion);
+
+		// Surface-pool tracking (Phase A): count this as a live texture surface
+		// and record which DKII.exe call site requested it.
+		if (Config.DdrawLogTextureAtlas && IsSurfaceTexture())
+		{
+			trackedTextureSurfaces[this] = 1;
+			LONG live = ++poolStats.liveTextureSurfaces;
+			if (live > poolStats.peakTextureSurfaces)
+			{
+				poolStats.peakTextureSurfaces = live;
+			}
+			poolStats.createdThisWindow++;
+			DWORD caller = FindGameCaller();
+			if (caller)
+			{
+				createCallerHist[caller]++;
+			}
+		}
 	}
 }
 
 void m_IDirectDrawSurfaceX::ReleaseInterface()
 {
+	// Surface-pool tracking (Phase A): a tracked texture surface is being destroyed.
+	if (Config.DdrawLogTextureAtlas)
+	{
+		auto it = trackedTextureSurfaces.find(this);
+		if (it != trackedTextureSurfaces.end())
+		{
+			trackedTextureSurfaces.erase(it);
+			poolStats.liveTextureSurfaces--;
+			poolStats.releasedThisWindow++;
+		}
+	}
+
 	{
 		ScopedCriticalSection ThreadLock(GetCriticalSection(), Config.Dd7to9);
 
@@ -5853,6 +6422,254 @@ void m_IDirectDrawSurfaceX::SetRenderTargetShadow()
 	}
 }
 
+void m_IDirectDrawSurfaceX::CaptureForPhaseA7FirstBind()
+{
+	if (!Config.DdrawContentCapture || !IsSurfaceTexture() || !surface.Texture) return;
+	// Pass `this` (the wrapper pointer) so TEX_HASH log matches DRAW_XYZRHW tex= field
+	CaptureSurfaceForPhaseA7FirstBind(surface.Texture, this);
+}
+
+m_IDirectDrawSurfaceX* m_IDirectDrawSurfaceX::GetCanonicalForPathB()
+{
+	if (!Config.DdrawCollapseAnimationPools) return this;
+	auto it = memberToCanonical.find(this);
+	if (it == memberToCanonical.end()) return this;
+	poolRedirectsTotal++;
+	return reinterpret_cast<m_IDirectDrawSurfaceX*>(it->second);
+}
+
+bool m_IDirectDrawSurfaceX::TryGetSubTextureForUV(float u_min, float v_min, float u_max, float v_max,
+	IDirect3DTexture9*& subTexOut,
+	float& regionU0Out, float& regionV0Out,
+	float& regionDuOut, float& regionDvOut,
+	int& regionIdxOut)
+{
+	subTexOut = nullptr; regionIdxOut = -1;
+	if (!Config.DdrawAtlasDecompose) return false;
+	if (!IsSurfaceTexture() || !surface.Texture) return false;
+
+	// Resolve the region set for this atlas. Two paths:
+	// (1) Fast path: exact content-hash lookup. Works for atlases with stable
+	//     surface bytes across sessions. Regions are bare UVRects (no source PNG).
+	// (2) Fallback: visual fingerprint match. Compute 32x32 grayscale once per
+	//     wrapper, L2-match against known family fingerprints, cache. Works for
+	//     pool atlases whose hashes drift but visual content is stable. Regions
+	//     are AtlasRegion (UV + optional source_png override for clean-source
+	//     synthesis -- see SOURCE_PNG path in the synthesis branch below).
+	const UVRect* hashRegions = nullptr;
+	const AtlasRegion* familyRegions = nullptr;
+	size_t numRegions = 0;
+	bool fromFingerprint = false;
+
+	auto hashIt = capState.firstHashByTex.find(this);
+	if (hashIt != capState.firstHashByTex.end())
+	{
+		auto regIt = kAtlasRegions.find(hashIt->second);
+		if (regIt != kAtlasRegions.end())
+		{
+			hashRegions = regIt->second.data();
+			numRegions = regIt->second.size();
+		}
+	}
+
+	if (!hashRegions)
+	{
+		// Fingerprint fallback.
+		auto fpIt = wrapperToFamilyIdx.find((void*)this);
+		int famIdx;
+		if (fpIt == wrapperToFamilyIdx.end())
+		{
+			uint8_t fp[1024];
+			if (!ComputeFingerprintFromTexture(surface.Texture, d3d9Device, fp))
+			{
+				wrapperToFamilyIdx[(void*)this] = FP_NO_MATCH;
+				return false;
+			}
+			float bestL2 = 0.0f;
+			famIdx = FindFamilyForFingerprint(fp, &bestL2);
+			wrapperToFamilyIdx[(void*)this] = famIdx;
+			char buf[160];
+			if (famIdx >= 0)
+			{
+				sprintf_s(buf, sizeof(buf), "[A.10 FP] match wrapper=%p family=%s L2=%.1f",
+					(void*)this, kAtlasFamilies[famIdx].name, bestL2);
+				fingerprintMatchTotal++;
+			}
+			else
+			{
+				sprintf_s(buf, sizeof(buf), "[A.10 FP] no-match wrapper=%p best_L2=%.1f (threshold=%.0f)",
+					(void*)this, bestL2, kFingerprintL2Threshold);
+			}
+			Logging::Log() << buf;
+		}
+		else
+		{
+			famIdx = fpIt->second;
+		}
+		if (famIdx < 0) return false;
+		familyRegions = kAtlasFamilies[famIdx].regions;
+		numRegions = kAtlasFamilies[famIdx].region_count;
+		fromFingerprint = true;
+	}
+
+	// First region whose rect contains the drawcall's UV bbox wins. Family
+	// regions are sorted smallest-first so the most-specific region matches
+	// (e.g. a 25%x25% subdivision wins over a 50%x50% containing one).
+	// Drawcalls crossing region boundaries fall through -- caller binds atlas.
+	for (size_t i = 0; i < numRegions; ++i)
+	{
+		const UVRect& rect = familyRegions ? familyRegions[i].uv : hashRegions[i];
+		const char* source_png = familyRegions ? familyRegions[i].source_png : nullptr;
+		if (!UVRectContains(rect, u_min, v_min, u_max, v_max)) continue;
+
+		SubTexKey key{ (void*)this, (int)i };
+		auto cacheIt = subTextureCache.find(key);
+		IDirect3DTexture9* sub = (cacheIt != subTextureCache.end()) ? cacheIt->second : nullptr;
+
+		// Path C: for fingerprint-matched atlases, redirect to canonical
+		// sub-texture for this (family, region) pair so Remix sees ONE hash
+		// per region across all N pool variants of this family.
+		int currentFamIdx = -1;
+		if (!sub && fromFingerprint)
+		{
+			currentFamIdx = wrapperToFamilyIdx[(void*)this];
+			uint64_t crKey = MakeFamilyRegionKey(currentFamIdx, (int)i);
+			auto crIt = canonicalByFamilyRegion.find(crKey);
+			if (crIt != canonicalByFamilyRegion.end())
+			{
+				sub = crIt->second;
+				subTextureCache[key] = sub;  // also wire per-wrapper cache for fast hit next time
+				pathCRedirectsTotal++;
+				char buf[200];
+				sprintf_s(buf, sizeof(buf), "[A.10 PathC] redirect atlas=%p family=%s region=%d -> canonical=%p",
+					(void*)this, kAtlasFamilies[currentFamIdx].name, (int)i, (void*)sub);
+				Logging::Log() << buf;
+			}
+		}
+
+		if (!sub)
+		{
+			// Lazy-create. Target dimensions match the atlas so Remix sees the
+			// natural-resolution staging buffer; the cropped pixels just get
+			// stretched. (Alternative: scale to region size for memory savings;
+			// 128x128 is cheap enough that we prefer hash stability.)
+			if (!d3d9Device || !*d3d9Device) return false;
+			const UINT atlasW = surface.Width;
+			const UINT atlasH = surface.Height;
+			if (atlasW == 0 || atlasH == 0) return false;
+			HRESULT hr = (*d3d9Device)->CreateTexture(atlasW, atlasH, 1, 0,
+				D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &sub, nullptr);
+			if (FAILED(hr) || !sub) return false;
+
+			IDirect3DSurface9* dstLevel = nullptr;
+			if (FAILED(sub->GetSurfaceLevel(0, &dstLevel)) || !dstLevel)
+			{
+				sub->Release(); return false;
+			}
+
+			// SOURCE_PNG path: when the region declares a clean source PNG,
+			// load it directly. The PNG bytes are byte-deterministic across
+			// sessions/machines -> Remix sees a stable XXH3 hash every run.
+			// This is the "1 logical texture per atlas" architecture: bypass
+			// the runtime composite atlas entirely and bind a known clean image.
+			HRESULT lh = D3DERR_INVALIDCALL;
+			bool usedSourcePng = false;
+			if (source_png)
+			{
+				char modulePath[MAX_PATH] = {};
+				GetModuleFileNameA(nullptr, modulePath, MAX_PATH);
+				std::string gameDir = modulePath;
+				auto slash = gameDir.find_last_of("\\/");
+				if (slash != std::string::npos) gameDir = gameDir.substr(0, slash);
+				std::string fullPath = gameDir + "\\" + source_png;
+				lh = D3DXLoadSurfaceFromFileA(dstLevel, nullptr, nullptr,
+					fullPath.c_str(), nullptr, D3DX_FILTER_LINEAR, 0, nullptr);
+				if (SUCCEEDED(lh))
+				{
+					usedSourcePng = true;
+				}
+				else
+				{
+					Logging::Log() << "[A.10] source PNG load failed (" << fullPath.c_str() << "), falling back to atlas crop. hr=" << (DWORD)lh;
+				}
+			}
+
+			RECT srcRect = {};
+			if (FAILED(lh))
+			{
+				// Atlas-crop fallback (existing behavior).
+				IDirect3DSurface9* srcLevel = nullptr;
+				if (FAILED(surface.Texture->GetSurfaceLevel(0, &srcLevel)) || !srcLevel)
+				{
+					dstLevel->Release(); sub->Release(); return false;
+				}
+				srcRect.left   = (LONG)(rect.u0 * atlasW);
+				srcRect.top    = (LONG)(rect.v0 * atlasH);
+				srcRect.right  = (LONG)(rect.u1 * atlasW);
+				srcRect.bottom = (LONG)(rect.v1 * atlasH);
+				lh = D3DXLoadSurfaceFromSurface(dstLevel, nullptr, nullptr,
+					srcLevel, nullptr, &srcRect, D3DX_FILTER_LINEAR, 0);
+				srcLevel->Release();
+				if (FAILED(lh)) { dstLevel->Release(); sub->Release(); return false; }
+			}
+
+			subTextureCache[key] = sub;
+
+			// Path C: this is the FIRST synthesis for (family, region) -- claim
+			// it as canonical so future pool variants of this family redirect to it.
+			if (fromFingerprint && currentFamIdx >= 0)
+			{
+				uint64_t crKey = MakeFamilyRegionKey(currentFamIdx, (int)i);
+				canonicalByFamilyRegion[crKey] = sub;
+				pathCCanonicalsCreated++;
+			}
+
+			{
+				char buf[280];
+				if (usedSourcePng)
+				{
+					sprintf_s(buf, sizeof(buf), "[A.10] synthesized sub-texture atlas=%p key=family:%s region=%d FROM_PNG=%s canonical",
+						(void*)this, kAtlasFamilies[currentFamIdx].name, (int)i, source_png);
+				}
+				else if (fromFingerprint)
+				{
+					sprintf_s(buf, sizeof(buf), "[A.10] synthesized sub-texture atlas=%p key=family:%s region=%d src=[%ld,%ld,%ld,%ld] canonical (atlas-crop)",
+						(void*)this, kAtlasFamilies[currentFamIdx].name, (int)i,
+						srcRect.left, srcRect.top, srcRect.right, srcRect.bottom);
+				}
+				else
+				{
+					sprintf_s(buf, sizeof(buf), "[A.10] synthesized sub-texture atlas=%p key=hash:%016llX region=%d src=[%ld,%ld,%ld,%ld]",
+						(void*)this, (unsigned long long)hashIt->second, (int)i,
+						srcRect.left, srcRect.top, srcRect.right, srcRect.bottom);
+				}
+				Logging::Log() << buf;
+			}
+
+			// Capture the synthesized content as a PNG + emit a TEX_HASH line keyed
+			// by the sub-texture pointer. This is the only chance to record it --
+			// the SetDirtyFlag / first-bind hooks both gate on m_IDirectDrawSurfaceX
+			// wrappers, and synthesized sub-textures bypass that path entirely.
+			// The "wrapper" key we pass is the sub-texture pointer itself; it's
+			// stable for the cache lifetime and unique per (atlas, region).
+			if (Config.DdrawContentCapture)
+			{
+				CaptureSurfaceContent(dstLevel, (void*)sub);
+			}
+			dstLevel->Release();
+		}
+		subTexOut = sub;
+		regionU0Out = rect.u0;
+		regionV0Out = rect.v0;
+		regionDuOut = rect.u1 - rect.u0;
+		regionDvOut = rect.v1 - rect.v0;
+		regionIdxOut = (int)i;
+		atlasDecomposeBindsTotal++;
+		return true;
+	}
+	return false;
+}
+
 void m_IDirectDrawSurfaceX::SetDirtyFlag(DWORD MipMapLevel)
 {
 	if (MipMapLevel == 0)
@@ -5868,6 +6685,34 @@ void m_IDirectDrawSurfaceX::SetDirtyFlag(DWORD MipMapLevel)
 
 		// Update Uniqueness Value
 		ChangeUniquenessValue(0);
+
+		// Phase A.7: continuous content capture. Fires here (instead of only inside
+		// CopyToDrawTexture) because non-color-key textures never go through that
+		// path -- the d3d9 SetTexture for them binds surface.Texture directly via
+		// Get3DTexture(). SetDirtyFlag is called after EVERY successful mip-0 write
+		// regardless of code path, so this catches all content the game produces.
+		if (Config.DdrawContentCapture && IsSurfaceTexture() && surface.Texture)
+		{
+			IDirect3DSurface9* level0 = nullptr;
+			if (SUCCEEDED(surface.Texture->GetSurfaceLevel(0, &level0)) && level0)
+			{
+				CaptureSurfaceContent(level0);
+				level0->Release();
+			}
+		}
+
+		// Phase A.10: invalidate cached fingerprint-family match for this wrapper.
+		// Game just wrote new content here -- our prior match decision (made on
+		// the OLD content) is stale. Next TryGetSubTextureForUV call will
+		// recompute the fingerprint against the current bytes. Fixes the
+		// cache-staleness bug where surfaces first bound with non-torch content
+		// stay cached as NO_MATCH even after getting Blt'd to torch content
+		// later (observed empirically as missing-magenta torches at L2/L3 zoom
+		// or after camera repositioning, 2026-05-20).
+		if (Config.DdrawAtlasDecompose)
+		{
+			wrapperToFamilyIdx.erase((void*)this);
+		}
 	}
 	// Mark mipmap data flag
 	if (MipMaps.size())
@@ -7542,6 +8387,27 @@ HRESULT m_IDirectDrawSurfaceX::CopyToDrawTexture(LPRECT lpDestRect)
 		return DDERR_GENERIC;
 	}
 
+	// Phase A.7: continuous content capture. Hashes the freshly-copied mip 0
+	// bytes (the layer the Remix bridge sees on upload). Dumps PNG + manifest
+	// row for each new content-hash this session. See ContentCaptureState block
+	// near the top of this file for full notes.
+	if (Config.DdrawContentCapture)
+	{
+		// Pass `this` (the wrapper) so TEX_HASH log matches DRAW_XYZRHW tex= field
+		CaptureSurfaceContent(DestSurface.Get(), this);
+	}
+
+	// Regenerate mip chain from the freshly-copied mip 0. Without this, mips
+	// 1..N retain whatever uninitialized data CreateTexture left in them --
+	// visible as white squares inside DK2 torches when the GPU samples lower
+	// LODs (camera zoomed out / far-away torches). Only relevant when AutoGen
+	// is off (we do the work the driver would otherwise do) and the texture
+	// has more than one level.
+	if (!IsMipMapAutogen() && surface.DrawTexture->GetLevelCount() > 1)
+	{
+		D3DXFilterTexture(surface.DrawTexture, nullptr, 0, D3DX_FILTER_BOX);
+	}
+
 	surface.IsDrawTextureDirty = false;
 
 	return DD_OK;
@@ -8717,4 +9583,100 @@ void m_IDirectDrawSurfaceX::SizeDummySurface(size_t size)
 void m_IDirectDrawSurfaceX::CleanupDummySurface()
 {
 	dummySurface.clear();
+}
+
+void m_IDirectDrawSurfaceX::LogAtlasTrackingAndReset()
+{
+	if (!Config.DdrawLogTextureAtlas)
+	{
+		return;
+	}
+
+	// Increment frame counter
+	lockTrackingFrame++;
+
+	// Only log every 60 frames to reduce spam
+	if (lockTrackingFrame % 60 != 0)
+	{
+		lockTrackingMap.clear();
+		return;
+	}
+
+	// Surface-pool dump (Phase A): live/peak texture-surface count, create/release
+	// churn over the last 60 frames, and the DKII.exe call sites doing the creating.
+	Logging::Log() << "=== SURFACE POOL FRAME " << lockTrackingFrame
+		<< " === live=" << poolStats.liveTextureSurfaces
+		<< " peak=" << poolStats.peakTextureSurfaces
+		<< " created/60f=" << poolStats.createdThisWindow
+		<< " released/60f=" << poolStats.releasedThisWindow
+		<< " bltToTex/60f=" << poolStats.bltToTextureThisWindow;
+	for (const auto& c : createCallerHist)
+	{
+		Logging::Log() << "  CREATE CALLER " << Logging::hex(c.first) << " count=" << c.second;
+	}
+	// Phase A.6: dump top blt destinations so we know which surfaces are
+	// receiving the baseline blts (candidate torch / animated surfaces).
+	if (!bltTargetsThisWindow.empty())
+	{
+		std::vector<std::pair<void*, BltDestInfo>> sorted(bltTargetsThisWindow.begin(), bltTargetsThisWindow.end());
+		std::sort(sorted.begin(), sorted.end(),
+			[](const std::pair<void*, BltDestInfo>& a, const std::pair<void*, BltDestInfo>& b) {
+				return a.second.count > b.second.count;
+			});
+		int emitted = 0;
+		for (const auto& p : sorted)
+		{
+			if (emitted++ >= 10) break;
+			Logging::Log() << "  BLT_TO " << p.first
+				<< " size=" << p.second.width << "x" << p.second.height
+				<< " count=" << p.second.count
+				<< " lastSrc=" << p.second.lastSrc;
+		}
+	}
+	bltTargetsThisWindow.clear();
+	poolStats.createdThisWindow = 0;
+	poolStats.releasedThisWindow = 0;
+	poolStats.bltToTextureThisWindow = 0;
+	createCallerHist.clear();
+
+	// Phase A.7: capture progress visible in the same per-window stream
+	if (Config.DdrawContentCapture && capState.initialized)
+	{
+		Logging::Log() << "  CAPTURE STATS bltSeenTotal=" << capState.bltSeenTotal
+			<< " bindSeenTotal=" << capState.bindSeenTotal
+			<< " uniqueSavedTotal=" << capState.savedTotal
+			<< " inMemoryHashes=" << capState.seenHashes.size()
+			<< " surfacesBound=" << capState.firstBindSeen.size();
+	}
+	if (Config.DdrawCollapseAnimationPools)
+	{
+		Logging::Log() << "  PATHB STATS activePools=" << poolsActiveTotal
+			<< " redirectMembers=" << memberToCanonical.size()
+			<< " redirectsThisSession=" << poolRedirectsTotal;
+	}
+
+	if (lockTrackingMap.empty())
+	{
+		Logging::Log() << "=== LOCK TRACKING FRAME " << lockTrackingFrame << " === (no locks)";
+		return;
+	}
+
+	Logging::Log() << "=== LOCK TRACKING FRAME " << lockTrackingFrame << " ===";
+
+	// Find surfaces with high lock counts (likely atlases being written to)
+	for (const auto& pair : lockTrackingMap)
+	{
+		const SurfaceLockStats& stats = pair.second;
+
+		// Log surfaces with write locks (potential atlas targets)
+		Logging::Log() << "SURFACE: " << pair.first
+			<< " size=" << stats.width << "x" << stats.height
+			<< " lockCount=" << stats.lockCount
+			<< " writeLocks=" << stats.writeLockCount;
+	}
+
+	Logging::Log() << "=== END LOCK TRACKING ===";
+
+	// Reset tracking for next frame
+	lockTrackingMap.clear();
 }

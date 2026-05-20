@@ -26,6 +26,8 @@
 typedef HRESULT(WINAPI* PFN_D3DXCreateTexture)(LPDIRECT3DDEVICE9 pDevice, UINT Width, UINT Height, UINT MipLevels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, LPDIRECT3DTEXTURE9* ppTexture);
 typedef HRESULT(WINAPI* PFN_D3DXLoadSurfaceFromMemory)(LPDIRECT3DSURFACE9 pDestSurface, const PALETTEENTRY* pDestPalette, const RECT* pDestRect, LPCVOID pSrcMemory, D3DFORMAT SrcFormat, UINT SrcPitch, const PALETTEENTRY* pSrcPalette, const RECT* pSrcRect, DWORD Filter, D3DCOLOR ColorKey);
 typedef HRESULT(WINAPI* PFN_D3DXLoadSurfaceFromSurface)(LPDIRECT3DSURFACE9 pDestSurface, const PALETTEENTRY* pDestPalette, const RECT* pDestRect, LPDIRECT3DSURFACE9 pSrcSurface, const PALETTEENTRY* pSrcPalette, const RECT* pSrcRect, DWORD Filter, D3DCOLOR ColorKey);
+typedef HRESULT(WINAPI* PFN_D3DXLoadSurfaceFromFileA)(LPDIRECT3DSURFACE9 pDestSurface, const PALETTEENTRY* pDestPalette, const RECT* pDestRect, LPCSTR pSrcFile, const RECT* pSrcRect, DWORD Filter, D3DCOLOR ColorKey, void* pSrcInfo);
+typedef HRESULT(WINAPI* PFN_D3DXFilterTexture)(LPDIRECT3DBASETEXTURE9 pBaseTexture, const PALETTEENTRY* pPalette, UINT SrcLevel, DWORD MipFilter);
 typedef HRESULT(WINAPI* PFN_D3DXSaveSurfaceToFileInMemory)(LPD3DXBUFFER* ppDestBuf, D3DXIMAGE_FILEFORMAT DestFormat, LPDIRECT3DSURFACE9 pSrcSurface, const PALETTEENTRY* pSrcPalette, const RECT* SrcRect);
 typedef HRESULT(WINAPI* PFN_D3DXSaveTextureToFileInMemory)(LPD3DXBUFFER* ppDestBuf, D3DXIMAGE_FILEFORMAT DestFormat, LPDIRECT3DBASETEXTURE9 pSrcTexture, const PALETTEENTRY* pSrcPalette);
 
@@ -60,6 +62,8 @@ HMEMORYMODULE d3dCompileModule = nullptr;
 PFN_D3DXCreateTexture p_D3DXCreateTexture = nullptr;
 PFN_D3DXLoadSurfaceFromMemory p_D3DXLoadSurfaceFromMemory = nullptr;
 PFN_D3DXLoadSurfaceFromSurface p_D3DXLoadSurfaceFromSurface = nullptr;
+PFN_D3DXLoadSurfaceFromFileA p_D3DXLoadSurfaceFromFileA = nullptr;
+PFN_D3DXFilterTexture p_D3DXFilterTexture = nullptr;
 PFN_D3DXSaveSurfaceToFileInMemory p_D3DXSaveSurfaceToFileInMemory = nullptr;
 PFN_D3DXSaveTextureToFileInMemory p_D3DXSaveTextureToFileInMemory = nullptr;
 PFN_D3DXDeclaratorFromFVF p_D3DXDeclaratorFromFVF = nullptr;
@@ -115,6 +119,8 @@ void LoadD3dx9()
 		p_D3DXCreateTexture = reinterpret_cast<PFN_D3DXCreateTexture>(MemoryGetProcAddress(d3dx9Module, "D3DXCreateTexture"));
 		p_D3DXLoadSurfaceFromMemory = reinterpret_cast<PFN_D3DXLoadSurfaceFromMemory>(MemoryGetProcAddress(d3dx9Module, "D3DXLoadSurfaceFromMemory"));
 		p_D3DXLoadSurfaceFromSurface = reinterpret_cast<PFN_D3DXLoadSurfaceFromSurface>(MemoryGetProcAddress(d3dx9Module, "D3DXLoadSurfaceFromSurface"));
+		p_D3DXLoadSurfaceFromFileA = reinterpret_cast<PFN_D3DXLoadSurfaceFromFileA>(MemoryGetProcAddress(d3dx9Module, "D3DXLoadSurfaceFromFileA"));
+		p_D3DXFilterTexture = reinterpret_cast<PFN_D3DXFilterTexture>(MemoryGetProcAddress(d3dx9Module, "D3DXFilterTexture"));
 		p_D3DXSaveSurfaceToFileInMemory = reinterpret_cast<PFN_D3DXSaveSurfaceToFileInMemory>(MemoryGetProcAddress(d3dx9Module, "D3DXSaveSurfaceToFileInMemory"));
 		p_D3DXSaveTextureToFileInMemory = reinterpret_cast<PFN_D3DXSaveTextureToFileInMemory>(MemoryGetProcAddress(d3dx9Module, "D3DXSaveTextureToFileInMemory"));
 		p_D3DXDeclaratorFromFVF = reinterpret_cast<PFN_D3DXDeclaratorFromFVF>(MemoryGetProcAddress(d3dx9Module, "D3DXDeclaratorFromFVF"));
@@ -222,6 +228,51 @@ HRESULT WINAPI D3DXLoadSurfaceFromSurface(LPDIRECT3DSURFACE9 pDestSurface, const
 	}
 
 	return D3D_OK;
+}
+
+HRESULT WINAPI D3DXLoadSurfaceFromFileA(LPDIRECT3DSURFACE9 pDestSurface, const PALETTEENTRY* pDestPalette, const RECT* pDestRect, LPCSTR pSrcFile, const RECT* pSrcRect, DWORD Filter, D3DCOLOR ColorKey, void* pSrcInfo)
+{
+	Logging::LogDebug() << __FUNCTION__;
+
+	LoadD3dx9();
+
+	if (!p_D3DXLoadSurfaceFromFileA)
+	{
+		LOG_ONCE(__FUNCTION__ << " Error: Could not find ProcAddress!");
+		return D3DERR_INVALIDCALL;
+	}
+
+	HRESULT hr = p_D3DXLoadSurfaceFromFileA(pDestSurface, pDestPalette, pDestRect, pSrcFile, pSrcRect, Filter, ColorKey, pSrcInfo);
+
+	if (FAILED(hr))
+	{
+		Logging::Log() << __FUNCTION__ << " Error: Failed to load surface from file: " << pSrcFile;
+		return hr;
+	}
+
+	LPDIRECT3DTEXTURE9 pDestTexture = nullptr;
+	if (SUCCEEDED(pDestSurface->GetContainer(IID_IDirect3DTexture9, (void**)&pDestTexture)))
+	{
+		pDestTexture->AddDirtyRect(pDestRect);
+		pDestTexture->Release();
+	}
+
+	return D3D_OK;
+}
+
+HRESULT WINAPI D3DXFilterTexture(LPDIRECT3DBASETEXTURE9 pBaseTexture, const PALETTEENTRY* pPalette, UINT SrcLevel, DWORD MipFilter)
+{
+	Logging::LogDebug() << __FUNCTION__;
+
+	LoadD3dx9();
+
+	if (!p_D3DXFilterTexture)
+	{
+		LOG_ONCE(__FUNCTION__ << " Error: Could not find ProcAddress!");
+		return D3DERR_INVALIDCALL;
+	}
+
+	return p_D3DXFilterTexture(pBaseTexture, pPalette, SrcLevel, MipFilter);
 }
 
 HRESULT WINAPI D3DXSaveSurfaceToFileInMemory(LPD3DXBUFFER* ppDestBuf, D3DXIMAGE_FILEFORMAT DestFormat, LPDIRECT3DSURFACE9 pSrcSurface, const PALETTEENTRY* pSrcPalette, const RECT* SrcRect)

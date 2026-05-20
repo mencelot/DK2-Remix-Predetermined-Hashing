@@ -520,6 +520,22 @@ public:
 	bool IsSurfaceDirty() const { return surface.IsDirtyFlag; }
 	bool IsMipMapAutogen() const { return surface.Texture && (surface.Usage & D3DUSAGE_AUTOGENMIPMAP); }
 	bool IsMipMapGenerated() const { return IsMipMapReadyToUse || IsMipMapAutogen(); }
+	// Phase A.7 v2: invoked from IDirect3DDeviceX::SetTexture site; routes to the
+	// file-local CaptureSurfaceForPhaseA7FirstBind in IDirectDrawSurfaceX.cpp.
+	void CaptureForPhaseA7FirstBind();
+	// Path B: if this surface is a non-canonical member of a detected animation
+	// pool (per dk2_phase_a7_content_capture memory), return the canonical
+	// wrapper -- else return `this`. Caller binds canonical->GetD3d9Texture().
+	class m_IDirectDrawSurfaceX* GetCanonicalForPathB();
+	// Phase A.10 atlas decomposition: if this surface is a known k-in-1 atlas and
+	// the drawcall's UV bounds match one of its regions, return the synthesized
+	// per-region sub-texture and the UV transform to map atlas UVs -> sub-tex UVs.
+	// Returns false if no match (caller binds the original atlas normally).
+	bool TryGetSubTextureForUV(float u_min, float v_min, float u_max, float v_max,
+		IDirect3DTexture9*& subTexOut,
+		float& regionU0Out, float& regionV0Out,
+		float& regionDuOut, float& regionDvOut,
+		int& regionIdxOut);
 	void FixTextureFlags(LPDDSURFACEDESC2 lpDDSurfaceDesc2);
 	void PrepareRenderTarget();
 	void ClearDirtyFlags();
@@ -588,4 +604,7 @@ public:
 	static void CleanupSharedEmulatedMemory();
 	static void SizeDummySurface(size_t size);
 	static void CleanupDummySurface();
+
+	// Atlas tracking for RTX Remix
+	static void LogAtlasTrackingAndReset();
 };

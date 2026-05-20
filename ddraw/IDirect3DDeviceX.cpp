@@ -16,6 +16,7 @@
 
 #include "ddraw.h"
 #include "d3d9\d3d9External.h"
+#include "RemixAPI.h"
 
 // ******************************
 // IUnknown functions
@@ -1294,6 +1295,65 @@ HRESULT m_IDirect3DDeviceX::BeginScene()
 #endif
 
 			PrepDevice();
+
+			// Set 3D camera matrices at START of scene for RTX Remix camera detection
+			// Must be done BEFORE draw calls, as camera is detected during draw call processing
+			if (Config.DdrawConvertHomogeneousToWorld)
+			{
+				if (!ConvertHomogeneous.IsTransformViewSet)
+				{
+					// Game never called SetTransform(D3DTS_VIEW) - compute default camera matrices
+					D3DVIEWPORT9 vp;
+					(*d3d9Device)->GetViewport(&vp);
+					const float width = (float)vp.Width;
+					const float height = (float)vp.Height;
+					const float fov = Config.DdrawConvertHomogeneousToWorldFOV;
+					const float nearplane = Config.DdrawConvertHomogeneousToWorldNearPlane;
+					const float farplane = Config.DdrawConvertHomogeneousToWorldFarPlane;
+					const float ratio = width / height;
+
+					// Create projection matrix (perspective, NOT orthographic)
+					DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveFovLH(
+						fov * (3.14159265359f / 180.0f), ratio, nearplane, farplane);
+					DirectX::XMStoreFloat4x4((DirectX::XMFLOAT4X4*)&ConvertHomogeneous.ToWorld_ProjectionMatrix, proj);
+
+					// Create view matrix - isometric camera looking down at 45 degrees
+					DirectX::XMVECTOR position = DirectX::XMVectorSet(0.0f, 800.0f, -800.0f, 0.0f);
+					DirectX::XMVECTOR direction = DirectX::XMVector3Normalize(
+						DirectX::XMVectorSet(0.0f, -0.707f, 0.707f, 0.0f));
+					DirectX::XMVECTOR upVector = DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+					DirectX::XMMATRIX viewMatrix = DirectX::XMMatrixLookToLH(position, direction, upVector);
+					DirectX::XMStoreFloat4x4((DirectX::XMFLOAT4X4*)&ConvertHomogeneous.ToWorld_ViewMatrix, viewMatrix);
+
+					// Create screen-to-NDC matrix (transforms screen coords 0-width,0-height to NDC -1 to 1)
+					// This is the same matrix used in SetTransform for XYZRHW handling
+					DirectX::XMMATRIX screenToNDC = DirectX::XMMatrixSet(
+						2.0f / width, 0.0f, 0.0f, 0.0f,
+						0.0f, -2.0f / height, 0.0f, 0.0f,
+						0.0f, 0.0f, 1.0f, 0.0f,
+						-1.0f, 1.0f, 0.0f, 1.0f
+					);
+
+					// Compute the inverse matrix for vertex transformation
+					// Full transform: screen -> NDC -> clip -> view -> world
+					DirectX::XMMATRIX vp_matrix = DirectX::XMMatrixMultiply(viewMatrix, proj);
+					DirectX::XMMATRIX vpinv = DirectX::XMMatrixInverse(nullptr, vp_matrix);
+					ConvertHomogeneous.ToWorld_ViewMatrixInverse = DirectX::XMMatrixMultiply(screenToNDC, vpinv);
+
+					ConvertHomogeneous.IsTransformViewSet = true;
+
+					static bool loggedDefault = false;
+					if (!loggedDefault)
+					{
+						Logging::Log() << __FUNCTION__ << " Initialized camera matrices in BeginScene (width=" << width << " height=" << height << ")";
+						loggedDefault = true;
+					}
+				}
+
+				// Set matrices via D3D9 BEFORE any draw calls
+				(*d3d9Device)->SetTransform(D3DTS_VIEW, &ConvertHomogeneous.ToWorld_ViewMatrix);
+				(*d3d9Device)->SetTransform(D3DTS_PROJECTION, &ConvertHomogeneous.ToWorld_ProjectionMatrix);
+			}
 		}
 
 		return hr;
@@ -1335,6 +1395,22 @@ HRESULT m_IDirect3DDeviceX::EndScene()
 
 		ScopedCriticalSection ThreadLockDD(DdrawWrapper::GetDDCriticalSection());
 
+		// Note: Camera matrices are now set in BeginScene (before draw calls)
+		// The EndScene code below is kept for Remix API (may not work on 32-bit through bridge)
+		if (Config.DdrawConvertHomogeneousToWorld)
+		{
+			// Try Remix API if available
+			RemixAPIManager& remixApi = RemixAPIManager::Instance();
+			if (!remixApi.IsInitialized())
+			{
+				const char* initError = nullptr;
+				if (remixApi.Initialize(&initError))
+				{
+					Logging::Log() << __FUNCTION__ << " RTX Remix API initialized successfully";
+				}
+			}
+		}
+
 		HRESULT hr = (*d3d9Device)->EndScene();
 
 #ifdef ENABLE_PROFILING
@@ -1353,6 +1429,9 @@ HRESULT m_IDirect3DDeviceX::EndScene()
 			{
 				lpCurrentRenderTargetX->EndWritePresent(nullptr, false);
 			}
+
+			// Log atlas tracking at end of frame
+			m_IDirectDrawSurfaceX::LogAtlasTrackingAndReset();
 		}
 
 		return hr;
@@ -2649,8 +2728,9 @@ HRESULT m_IDirect3DDeviceX::SetTransform(D3DTRANSFORMSTATETYPE dtstTransformStat
 						}
 						else
 						{
-							position = DirectX::XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
-							direction = DirectX::XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+							// DK2 isometric camera - positioned above, looking down at ~45 degree angle
+							position = DirectX::XMVectorSet(0.0f, 800.0f, -800.0f, 0.0f);
+							direction = DirectX::XMVector3Normalize(DirectX::XMVectorSet(0.0f, -0.707f, 0.707f, 0.0f));
 						}
 
 						// Store the original matrix so it can be restored
@@ -2862,6 +2942,151 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 		// Update vertices for Direct3D9 (needs to be first)
 		UpdateVertices(dwVertexTypeDesc, lpVertices, 0, dwVertexCount);
 
+		// === UI detection via RHW-constancy heuristic ===
+		// Pre-transformed UI overlays use a constant RHW per draw call (no perspective
+		// division applied). Pre-transformed 3D world geometry has varying RHW (= 1/W).
+		// If RHW is constant across the verts, treat this draw as UI: skip the inverse
+		// projection so Remix sees pure XYZRHW screen-space verts and can render it as
+		// a 2D overlay rather than path-traced world geometry.
+		bool isUIPassthrough = false;
+		float uiHeuristicMinRHW = 0.0f, uiHeuristicMaxRHW = 0.0f;
+		if ((dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW && dwVertexCount > 0 && lpVertices)
+		{
+			const UINT scanStride = GetVertexStride(dwVertexTypeDesc);
+			const UINT8* scanVertex = (const UINT8*)lpVertices;
+			uiHeuristicMinRHW = uiHeuristicMaxRHW = ((const float*)scanVertex)[3];
+			for (UINT i = 1; i < dwVertexCount; i++)
+			{
+				scanVertex += scanStride;
+				const float rhw = ((const float*)scanVertex)[3];
+				if (rhw < uiHeuristicMinRHW) uiHeuristicMinRHW = rhw;
+				if (rhw > uiHeuristicMaxRHW) uiHeuristicMaxRHW = rhw;
+			}
+			const float denom = (uiHeuristicMaxRHW > 0.0f) ? uiHeuristicMaxRHW : 1.0f;
+			isUIPassthrough = ((uiHeuristicMaxRHW - uiHeuristicMinRHW) / denom) < 1e-4f;
+
+			// === Phase A.8 (atlas decomposition prep): UV bounds for stage 0 ===
+			// Each drawcall samples a sub-rectangle of the bound atlas. Aggregating
+			// (tex_ptr, u_min, v_min, u_max, v_max) per draw lets us cluster atlas
+			// usage by UV region offline -- 1-in-1 atlases show single region,
+			// k-in-1 atlases show k discrete clusters of varying shape.
+			float u_min = 0, u_max = 0, v_min = 0, v_max = 0;
+			bool has_uv = false;
+			const DWORD numTexCoords = (dwVertexTypeDesc & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+			if (numTexCoords > 0)
+			{
+				UINT uvOff = 16;  // XYZRHW = 4 floats
+				if (dwVertexTypeDesc & D3DFVF_RESERVED1) uvOff += 4;
+				if (dwVertexTypeDesc & D3DFVF_DIFFUSE) uvOff += 4;
+				if (dwVertexTypeDesc & D3DFVF_SPECULAR) uvOff += 4;
+				const UINT8* vbase = (const UINT8*)lpVertices;
+				const float* uv0 = (const float*)(vbase + uvOff);
+				u_min = u_max = uv0[0];
+				v_min = v_max = uv0[1];
+				for (UINT i = 1; i < dwVertexCount; i++)
+				{
+					const float* uv = (const float*)(vbase + i * scanStride + uvOff);
+					if (uv[0] < u_min) u_min = uv[0];
+					if (uv[0] > u_max) u_max = uv[0];
+					if (uv[1] < v_min) v_min = uv[1];
+					if (uv[1] > v_max) v_max = uv[1];
+				}
+				has_uv = true;
+			}
+
+			void* uiTexPtr = (void*)CurrentTextureSurfaceX[0];
+			LOG_LIMIT(20000, "DRAW_XYZRHW DrawPrimitive ui=" << (isUIPassthrough ? 1 : 0)
+				<< " vcount=" << dwVertexCount
+				<< " rhw=[" << uiHeuristicMinRHW << "," << uiHeuristicMaxRHW << "]"
+				<< " tex=" << uiTexPtr
+				<< (has_uv ? (std::string(" uv=[") + std::to_string(u_min) + "," + std::to_string(v_min) + "," + std::to_string(u_max) + "," + std::to_string(v_max) + "]").c_str() : ""));
+		}
+
+		// Handle PositionT (pre-transformed vertices) - convert to world space for RTX Remix
+		// UI passthrough draws skip this branch entirely so they emit as XYZRHW screen-space.
+		if (Config.DdrawConvertHomogeneousW && (dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW && !isUIPassthrough)
+		{
+			static bool loggedDrawPrimConversion = false;
+			if (!loggedDrawPrimConversion)
+			{
+				Logging::Log() << __FUNCTION__ << " Converting XYZRHW to world space (DrawPrimitive)";
+				loggedDrawPrimConversion = true;
+			}
+
+			if (!ConvertHomogeneous.IsTransformViewSet)
+			{
+				D3DMATRIX Matrix = {};
+				GetTransform(D3DTS_VIEW, &Matrix);
+				SetTransform(D3DTS_VIEW, &Matrix);
+			}
+
+			if (!Config.DdrawConvertHomogeneousToWorld)
+			{
+				// Update the FVF
+				dwVertexTypeDesc = (dwVertexTypeDesc & ~D3DFVF_XYZRHW) | D3DFVF_XYZW;
+			}
+			else
+			{
+				const UINT stride = GetVertexStride(dwVertexTypeDesc);
+				const UINT targetStride = stride - sizeof(float);
+				const UINT restSize = stride - sizeof(float) * 4;
+
+				ConvertHomogeneous.ToWorld_IntermediateGeometry.resize(targetStride * dwVertexCount);
+
+				UINT8* sourceVertex = (UINT8*)lpVertices;
+				UINT8* targetVertex = (UINT8*)ConvertHomogeneous.ToWorld_IntermediateGeometry.data();
+
+				lpVertices = targetVertex;
+
+				for (UINT x = 0; x < dwVertexCount; x++)
+				{
+					// Transform the vertices into world space
+					float* srcpos = (float*)sourceVertex;
+					float* trgtpos = (float*)targetVertex;
+
+					DirectX::XMVECTOR xpos = DirectX::XMVectorSet(srcpos[0], srcpos[1], srcpos[2], srcpos[3]);
+					DirectX::XMVECTOR xpos_global = DirectX::XMVector3TransformCoord(xpos, ConvertHomogeneous.ToWorld_ViewMatrixInverse);
+					xpos_global = DirectX::XMVectorDivide(xpos_global, DirectX::XMVectorSplatW(xpos_global));
+
+					trgtpos[0] = DirectX::XMVectorGetX(xpos_global);
+					trgtpos[1] = DirectX::XMVectorGetY(xpos_global);
+					trgtpos[2] = DirectX::XMVectorGetZ(xpos_global);
+
+					// Copy the rest
+					std::memcpy(targetVertex + sizeof(float) * 3, sourceVertex + sizeof(float) * 4, restSize);
+
+					// Move to next vertex
+					sourceVertex += stride;
+					targetVertex += targetStride;
+				}
+
+				// Set transform
+				(*d3d9Device)->SetTransform(D3DTS_VIEW, &ConvertHomogeneous.ToWorld_ViewMatrix);
+				(*d3d9Device)->SetTransform(D3DTS_PROJECTION, &ConvertHomogeneous.ToWorld_ProjectionMatrix);
+
+				// Update the FVF
+				const DWORD newVertexTypeDesc = (dwVertexTypeDesc & ~D3DFVF_XYZRHW) | D3DFVF_XYZ;
+
+				// Set fixed function vertex type
+				if (FAILED((*d3d9Device)->SetFVF(newVertexTypeDesc)))
+				{
+					LOG_LIMIT(100, __FUNCTION__ << " Error: invalid FVF type: " << Logging::hex(dwVertexTypeDesc));
+					return D3DERR_INVALIDVERTEXTYPE;
+				}
+
+				// Handle dwFlags
+				SetDrawStates(newVertexTypeDesc, dwFlags, DirectXVersion);
+
+				// Draw primitive UP
+				HRESULT hr = (*d3d9Device)->DrawPrimitiveUP(dptPrimitiveType, GetNumberOfPrimitives(dptPrimitiveType, dwVertexCount), lpVertices, targetStride);
+
+				// Handle dwFlags
+				RestoreDrawStates(hr, newVertexTypeDesc, dwFlags);
+
+				return hr;
+			}
+		}
+
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(dwVertexTypeDesc)))
 		{
@@ -2955,9 +3180,95 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 		// Update vertices for Direct3D9 (needs to be first)
 		UpdateVertices(dwVertexTypeDesc, lpVertices, 0, dwVertexCount);
 
-		// Handle PositionT
-		if (Config.DdrawConvertHomogeneousW && (dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW)
+		// === UI detection via RHW-constancy heuristic (see DrawPrimitive for rationale) ===
+		bool isUIPassthrough = false;
+		float uiHeuristicMinRHW = 0.0f, uiHeuristicMaxRHW = 0.0f;
+		// Phase A.10 atlas decomposition state -- populated inside the XYZRHW block,
+		// consumed at the d3d9 draw call sites below. uvOffBase is the byte offset
+		// of stage-0 UV in the ORIGINAL (XYZRHW) vertex; converted-buffer offset is
+		// uvOffBase-4 because the conversion drops RHW.
+		IDirect3DTexture9* atlasDecomposeSubTex = nullptr;
+		float adRegU0 = 0.0f, adRegV0 = 0.0f, adRegDu = 1.0f, adRegDv = 1.0f;
+		int adRegIdx = -1;
+		UINT atlasDecomposeUVOffBase = 0;
+		if ((dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW && dwVertexCount > 0 && lpVertices)
 		{
+			const UINT scanStride = GetVertexStride(dwVertexTypeDesc);
+			const UINT8* scanVertex = (const UINT8*)lpVertices;
+			uiHeuristicMinRHW = uiHeuristicMaxRHW = ((const float*)scanVertex)[3];
+			for (UINT i = 1; i < dwVertexCount; i++)
+			{
+				scanVertex += scanStride;
+				const float rhw = ((const float*)scanVertex)[3];
+				if (rhw < uiHeuristicMinRHW) uiHeuristicMinRHW = rhw;
+				if (rhw > uiHeuristicMaxRHW) uiHeuristicMaxRHW = rhw;
+			}
+			const float denom = (uiHeuristicMaxRHW > 0.0f) ? uiHeuristicMaxRHW : 1.0f;
+			isUIPassthrough = ((uiHeuristicMaxRHW - uiHeuristicMinRHW) / denom) < 1e-4f;
+
+			// Phase A.8: same UV-bounds scan as DrawPrimitive site (see comment there)
+			float u_min = 0, u_max = 0, v_min = 0, v_max = 0;
+			bool has_uv = false;
+			const DWORD numTexCoords = (dwVertexTypeDesc & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+			if (numTexCoords > 0)
+			{
+				UINT uvOff = 16;
+				if (dwVertexTypeDesc & D3DFVF_RESERVED1) uvOff += 4;
+				if (dwVertexTypeDesc & D3DFVF_DIFFUSE) uvOff += 4;
+				if (dwVertexTypeDesc & D3DFVF_SPECULAR) uvOff += 4;
+				const UINT8* vbase = (const UINT8*)lpVertices;
+				const float* uv0 = (const float*)(vbase + uvOff);
+				u_min = u_max = uv0[0];
+				v_min = v_max = uv0[1];
+				for (UINT i = 1; i < dwVertexCount; i++)
+				{
+					const float* uv = (const float*)(vbase + i * scanStride + uvOff);
+					if (uv[0] < u_min) u_min = uv[0];
+					if (uv[0] > u_max) u_max = uv[0];
+					if (uv[1] < v_min) v_min = uv[1];
+					if (uv[1] > v_max) v_max = uv[1];
+				}
+				has_uv = true;
+				atlasDecomposeUVOffBase = uvOff;
+			}
+
+			void* uiTexPtr = (void*)CurrentTextureSurfaceX[0];
+			LOG_LIMIT(20000, "DRAW_XYZRHW DrawIndexedPrimitive ui=" << (isUIPassthrough ? 1 : 0)
+				<< " vcount=" << dwVertexCount << " icount=" << dwIndexCount
+				<< " rhw=[" << uiHeuristicMinRHW << "," << uiHeuristicMaxRHW << "]"
+				<< " tex=" << uiTexPtr
+				<< (has_uv ? (std::string(" uv=[") + std::to_string(u_min) + "," + std::to_string(v_min) + "," + std::to_string(u_max) + "," + std::to_string(v_max) + "]").c_str() : ""));
+
+			// Phase A.10: probe the atlas-region map for this drawcall. Match by
+			// content hash (stable across sessions) + UV bbox containment (with
+			// rasterizer-rounding slack). On a hit, the synthesized sub-texture
+			// will be bound after SetDrawStates and the vertex UVs will be
+			// rewritten to [0,1] over the sub-texture rect.
+			if (Config.DdrawAtlasDecompose && has_uv && CurrentTextureSurfaceX[0])
+			{
+				CurrentTextureSurfaceX[0]->TryGetSubTextureForUV(u_min, v_min, u_max, v_max,
+					atlasDecomposeSubTex, adRegU0, adRegV0, adRegDu, adRegDv, adRegIdx);
+			}
+		}
+
+		// Handle PositionT
+		// UI passthrough draws skip this branch entirely so they emit as XYZRHW screen-space.
+		if (Config.DdrawConvertHomogeneousW && (dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW && !isUIPassthrough)
+		{
+			static bool loggedDrawIndexedConversion = false;
+			if (!loggedDrawIndexedConversion)
+			{
+				Logging::Log() << __FUNCTION__ << " Converting XYZRHW to world space (DrawIndexedPrimitive)";
+				Logging::Log() << "  Projection matrix [0][0]=" << ConvertHomogeneous.ToWorld_ProjectionMatrix._11
+					<< " [1][1]=" << ConvertHomogeneous.ToWorld_ProjectionMatrix._22
+					<< " [2][2]=" << ConvertHomogeneous.ToWorld_ProjectionMatrix._33
+					<< " [3][3]=" << ConvertHomogeneous.ToWorld_ProjectionMatrix._44;
+				Logging::Log() << "  View matrix [3][0]=" << ConvertHomogeneous.ToWorld_ViewMatrix._41
+					<< " [3][1]=" << ConvertHomogeneous.ToWorld_ViewMatrix._42
+					<< " [3][2]=" << ConvertHomogeneous.ToWorld_ViewMatrix._43;
+				loggedDrawIndexedConversion = true;
+			}
+
 			if (!ConvertHomogeneous.IsTransformViewSet)
 			{
 				D3DMATRIX Matrix = {};
@@ -3030,8 +3341,31 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 					return D3DERR_INVALIDVERTEXTYPE;
 				}
 
+				// Phase A.10: rewrite UVs in the converted-buffer to [0,1] over the
+				// matched sub-region. RHW was dropped (XYZRHW -> XYZ), so the UV
+				// offset is uvOffBase - 4 here.
+				if (atlasDecomposeSubTex && atlasDecomposeUVOffBase >= 4 && adRegDu > 0.0f && adRegDv > 0.0f)
+				{
+					const UINT uvOffConv = atlasDecomposeUVOffBase - 4;
+					UINT8* tv = (UINT8*)ConvertHomogeneous.ToWorld_IntermediateGeometry.data();
+					for (UINT vi = 0; vi < dwVertexCount; vi++)
+					{
+						float* uv = (float*)(tv + vi * targetStride + uvOffConv);
+						uv[0] = (uv[0] - adRegU0) / adRegDu;
+						uv[1] = (uv[1] - adRegV0) / adRegDv;
+					}
+				}
+
 				// Handle dwFlags
 				SetDrawStates(newVertexTypeDesc, dwFlags, DirectXVersion);
+
+				// Phase A.10: override the atlas binding with the synthesized
+				// sub-texture. Must come AFTER SetDrawStates (which is what does
+				// the original SetTexture).
+				if (atlasDecomposeSubTex)
+				{
+					(*d3d9Device)->SetTexture(0, atlasDecomposeSubTex);
+				}
 
 				// Draw indexed primitive UP
 				HRESULT hr = (*d3d9Device)->DrawIndexedPrimitiveUP(dptPrimitiveType, 0, dwVertexCount, GetNumberOfPrimitives(dptPrimitiveType, dwIndexCount), lpwIndices, D3DFMT_INDEX16, lpVertices, targetStride);
@@ -3039,14 +3373,8 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 				// Handle dwFlags
 				RestoreDrawStates(hr, newVertexTypeDesc, dwFlags);
 
-				// Restore transform
-				D3DMATRIX identityMatrix = {};
-				identityMatrix._11 = 1.0f;
-				identityMatrix._22 = 1.0f;
-				identityMatrix._33 = 1.0f;
-
-				(*d3d9Device)->SetTransform(D3DTS_VIEW, &ConvertHomogeneous.ToWorld_ViewMatrixOriginal);
-				(*d3d9Device)->SetTransform(D3DTS_PROJECTION, &identityMatrix);
+				// NOTE: Do NOT restore transform - keep 3D camera matrices set for RTX Remix detection
+				// The original code restored the matrices here which prevented RTX Remix from detecting the camera
 
 				return hr;
 			}
@@ -3059,8 +3387,35 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 			return DDERR_INVALIDPARAMS;
 		}
 
+		// Phase A.10: for the non-conversion path, lpVertices still points at
+		// user memory -- copy to a scratch buffer before rewriting UVs.
+		// Single-threaded so a static buffer is safe (matches the pattern of
+		// ToWorld_IntermediateGeometry above).
+		static thread_local std::vector<uint8_t> atlasDecomposeScratch;
+		if (atlasDecomposeSubTex && atlasDecomposeUVOffBase >= 16 && adRegDu > 0.0f && adRegDv > 0.0f)
+		{
+			const UINT stride = GetVertexStride(dwVertexTypeDesc);
+			const UINT total = stride * dwVertexCount;
+			atlasDecomposeScratch.resize(total);
+			memcpy(atlasDecomposeScratch.data(), lpVertices, total);
+			UINT8* tv = atlasDecomposeScratch.data();
+			for (UINT vi = 0; vi < dwVertexCount; vi++)
+			{
+				float* uv = (float*)(tv + vi * stride + atlasDecomposeUVOffBase);
+				uv[0] = (uv[0] - adRegU0) / adRegDu;
+				uv[1] = (uv[1] - adRegV0) / adRegDv;
+			}
+			lpVertices = tv;
+		}
+
 		// Handle dwFlags
 		SetDrawStates(dwVertexTypeDesc, dwFlags, DirectXVersion);
+
+		// Phase A.10: override atlas bind with the synthesized sub-texture.
+		if (atlasDecomposeSubTex)
+		{
+			(*d3d9Device)->SetTexture(0, atlasDecomposeSubTex);
+		}
 
 		// Draw indexed primitive UP
 		HRESULT hr = (*d3d9Device)->DrawIndexedPrimitiveUP(dptPrimitiveType, 0, dwVertexCount, GetNumberOfPrimitives(dptPrimitiveType, dwIndexCount), lpwIndices, D3DFMT_INDEX16, lpVertices, GetVertexStride(dwVertexTypeDesc));
@@ -4441,6 +4796,23 @@ HRESULT m_IDirect3DDeviceX::SetTexture(DWORD dwStage, LPDIRECTDRAWSURFACE7 lpSur
 
 		AttachedTexture[dwStage] = lpSurface;
 		CurrentTextureSurfaceX[dwStage] = lpDDSrcSurfaceX;
+
+		// Log SetTexture calls for atlas analysis
+		if (Config.DdrawLogTextureAtlas && lpDDSrcSurfaceX)
+		{
+			static DWORD setTextureLogCount = 0;
+			setTextureLogCount++;
+			// Log every 1000th call to avoid spam
+			if (setTextureLogCount % 1000 == 1)
+			{
+				DWORD texWidth = 0, texHeight = 0;
+				lpDDSrcSurfaceX->GetSurfaceSetSize(texWidth, texHeight);
+				Logging::Log() << "SETTEXTURE #" << setTextureLogCount
+					<< " stage=" << dwStage
+					<< " surface=" << lpDDSrcSurfaceX
+					<< " size=" << texWidth << "x" << texHeight;
+			}
+		}
 
 		return D3D_OK;
 	}
@@ -6494,10 +6866,19 @@ void m_IDirect3DDeviceX::SetDrawStates(DWORD dwVertexTypeDesc, DWORD& dwFlags, D
 		// Set textures
 		if (CurrentTextureSurfaceX[x])
 		{
-			IDirect3DTexture9* pTexture9 = CurrentTextureSurfaceX[x]->GetD3d9Texture();
+			// Path B: collapse animation-pool members to one canonical surface
+			// (no-op when DdrawCollapseAnimationPools=0; identity-returns).
+			m_IDirectDrawSurfaceX* effective = CurrentTextureSurfaceX[x]->GetCanonicalForPathB();
+			IDirect3DTexture9* pTexture9 = effective->GetD3d9Texture();
 			if (pTexture9)
 			{
 				(*d3d9Device)->SetTexture(x, pTexture9);
+				// Phase A.7 v2: capture content at first bind for static textures
+				// (loaded once at init and never re-dirtied -- SetDirtyFlag hook
+				// misses these). Internal dedup makes this one-shot per surface.
+				// NOTE: we capture from the ORIGINAL surface (not the redirect target)
+				// so the corpus still enumerates pool members.
+				CurrentTextureSurfaceX[x]->CaptureForPhaseA7FirstBind();
 			}
 			// Generate MipMap levels
 			if (DeviceStates.TextureStageState[x][D3DTSS_MIPFILTER].State != D3DTEXF_NONE && !CurrentTextureSurfaceX[x]->IsMipMapGenerated())
