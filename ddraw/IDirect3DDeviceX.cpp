@@ -18,6 +18,203 @@
 #include "d3d9\d3d9External.h"
 #include "RemixAPI.h"
 
+// Stage 3 measurement (2026-05-27): defined in IDirectDrawSurfaceX.cpp. Called on
+// every d3d9 SetTexture binding so we can aggregate per-hash bind counts and answer
+// "which hashes does Remix actually request" with real data. See
+// dk2_mission_measure_before_claiming memory.
+extern void Stage3OnRemixBind(IDirect3DTexture9* d3d9Tex, bool isCrop);
+// Dynamic-UI emissive (2026-06-11): per-draw classification accessors (set inside
+// TryGetUniversalSubTextureForUV when the draw's placement resolves to a
+// runtime-rendered UI name -- pointer strips / tooltips / minimap).
+extern void NamekeyResetDrawDynUi();
+// [BLITQUAD] menu-text fix (defined in IDirectDrawSurfaceX.cpp)
+extern bool MenuBlitOverlayDrawActive();
+extern void MenuBlitOverlayDrain(m_IDirect3DDeviceX* pDevice, LPDIRECT3DDEVICE9 dev);
+extern IDirect3DTexture9* MenuBlitOverlayCurrentTex();
+extern bool NamekeyGetDrawDynUi();
+extern void NamekeyNoteDynUiDraw();
+extern bool NamekeyGetDrawWater();
+extern void NamekeyNoteWaterFlatten();
+
+// Water surface fit (2026-06-11, build 8163). History: per-draw Y-average flatten
+// (8161) -> seam lattice (every draw its own plane); single global level (8162) ->
+// water vanished except where the level crossed the terrain, because run-13's
+// WATERLVL data showed the inverse projection reconstructs the FLAT water plane as
+// a gently bowed surface (true wave amplitude ~0.2-0.6 units, but water verts span
+// 2-8+ units across one frame -- a 0.3-0.5% spatial distortion of world space).
+// The flatten must FOLLOW that bow: each frame we least-squares-fit a quadratic
+// surface y(x,z) = c0 + c1*u + c2*v + c3*u^2 + c4*u*v + c5*v^2 (u,v = centered,
+// scaled x,z) to the frame's raw water verts, reject outliers (shore skirts, the
+// occasional wild vert), refit, and snap NEXT frame's water verts to the surface
+// evaluated at their own (x,z) -- one analytic surface, so no seams; it tracks the
+// bow, so no vanishing; thousands of verts average the sine out, so it is
+// temporally still. Verts farther than the snap band from the surface keep their
+// height (shore skirts stay anchored). 5s without water draws resets everything
+// (loading/map change). Draw path and EndScene share the DD critical section.
+// STATELESS ERA (2026-06-12): the temporal estimators (EMA'd normal equations,
+// zoom-step detector, sparse-frame adaptation -- see git history, builds 8164-8167)
+// chased the camera-dependent reconstruction with visible rise/fall lag during
+// cinematic and possession camera motion; the user directed abandoning estimation.
+// Now the serving surface IS the previous frame's fit, verbatim: one frame of lag,
+// camera-independent by construction. Water keeps the game's gentle swell (run-14
+// finding: within one frame, verts lie on a smooth surface; the swell is that
+// surface breathing over time) -- spatially smoothed, no chop, no seams, no chase.
+// The true kill (game-side wave patch; "Sine Wave Water" string at exe 0x2B5DDC)
+// is the prepared endgame if the residual swell bothers under translucency.
+static bool   g_waterSurfValid = false;
+static double g_waterSurfCoef[6] = {};					// SERVING surface (solved from the EMA'd normals)
+static double g_waterSurfCx = 0.0, g_waterSurfCz = 0.0;	// centering point (fit epoch)
+static double g_waterSurfScale = 1.0;					// coordinate scale -> u,v ~ O(1)
+static bool   g_waterSurfEpochSet = false;
+static float  g_waterSurfBand = 1.0f;					// snap only |y - S(x,z)| <= band
+static DWORD  g_waterSurfAgeFrames = 0;					// frames since the serving fit was refreshed (stateless era: ages out fast)
+static std::vector<float> g_waterFrameXYZ;				// raw x,y,z triplets this frame
+static DWORD  g_waterFrameDraws = 0;
+static DWORD  g_waterVertsTotal = 0;					// water verts seen this frame
+static DWORD  g_waterVertsSnapped = 0;					// ...of which snapped (coverage telemetry)
+static float  g_waterFrameYMin = 0.0f;					// raw height extremes this frame
+static float  g_waterFrameYMax = 0.0f;
+static DWORD  g_waterLastDrawMs = 0;
+static DWORD  g_waterLvlPublishes = 0;
+static const size_t kWaterFrameVertCap = 60000;			// 720 KB worst case, then sampling stops
+static const float  kWaterBandFloor = 0.45f;			// band covers the residual swell around the live fit...
+static const float  kWaterBandCap = 1.2f;				// ...but stays under shore-lip height (run-15 water-over-land)
+
+// Evaluate a quadratic surface (given coefficients) at world (x, z).
+static inline float WaterEvalCoef(const double coef[6], float x, float z)
+{
+	const double u = ((double)x - g_waterSurfCx) * g_waterSurfScale;
+	const double v = ((double)z - g_waterSurfCz) * g_waterSurfScale;
+	return (float)(coef[0] + coef[1] * u + coef[2] * v +
+		coef[3] * u * u + coef[4] * u * v + coef[5] * v * v);
+}
+
+// Evaluate the CURRENT fitted surface at world (x, z).
+static inline float WaterSurfEval(float x, float z)
+{
+	return WaterEvalCoef(g_waterSurfCoef, x, z);
+}
+
+// Solve the 6x6 normal equations (Gaussian elimination, partial pivoting).
+static bool WaterSolve6(double A[6][6], double b[6], double out[6])
+{
+	int piv[6] = { 0, 1, 2, 3, 4, 5 };
+	for (int col = 0; col < 6; col++)
+	{
+		int best = col;
+		for (int r = col + 1; r < 6; r++)
+			if (fabs(A[piv[r]][col]) > fabs(A[piv[best]][col])) best = r;
+		int t = piv[col]; piv[col] = piv[best]; piv[best] = t;
+		const double d = A[piv[col]][col];
+		if (fabs(d) < 1e-12) return false;	// degenerate (e.g. all water collinear on screen)
+		for (int r = col + 1; r < 6; r++)
+		{
+			const double f = A[piv[r]][col] / d;
+			if (f == 0.0) continue;
+			for (int c = col; c < 6; c++) A[piv[r]][c] -= f * A[piv[col]][c];
+			b[piv[r]] -= f * b[piv[col]];
+		}
+	}
+	for (int col = 5; col >= 0; col--)
+	{
+		double s = b[piv[col]];
+		for (int c = col + 1; c < 6; c++) s -= A[piv[col]][c] * out[c];
+		out[col] = s / A[piv[col]][col];
+	}
+	return true;
+}
+
+// Accumulate the per-vert-normalized 6x6 normal equations over the vert list.
+// When baseline != nullptr, only verts within keepBand of the baseline surface
+// contribute (outlier reject: shore skirts and stray geometry drop out).
+// Returns the kept count (0 = nothing usable). A/b come back DIVIDED by kept so
+// frames of different vert counts carry equal weight in the temporal EMA.
+static size_t WaterAccumNormals(const std::vector<float>& xyz, const double* baseline, float keepBand, double A[6][6], double b[6])
+{
+	for (int r = 0; r < 6; r++) { b[r] = 0.0; for (int c = 0; c < 6; c++) A[r][c] = 0.0; }
+	size_t kept = 0;
+	const size_t n = xyz.size() / 3;
+	for (size_t i = 0; i < n; i++)
+	{
+		const float x = xyz[i * 3 + 0], y = xyz[i * 3 + 1], z = xyz[i * 3 + 2];
+		if (baseline && fabsf(y - WaterEvalCoef(baseline, x, z)) > keepBand) continue;
+		const double u = ((double)x - g_waterSurfCx) * g_waterSurfScale;
+		const double v = ((double)z - g_waterSurfCz) * g_waterSurfScale;
+		const double row[6] = { 1.0, u, v, u * u, u * v, v * v };
+		for (int r = 0; r < 6; r++)
+		{
+			for (int c = r; c < 6; c++) A[r][c] += row[r] * row[c];
+			b[r] += row[r] * (double)y;
+		}
+		kept++;
+	}
+	if (kept < 24) return 0;	// need comfortable headroom over 6 unknowns
+	for (int r = 1; r < 6; r++)
+		for (int c = 0; c < r; c++) A[r][c] = A[c][r];
+	const double inv = 1.0 / (double)kept;
+	for (int r = 0; r < 6; r++) { b[r] *= inv; for (int c = 0; c < 6; c++) A[r][c] *= inv; }
+	return kept;
+}
+
+// RMS residual of the (baseline-filtered) verts against the given surface.
+// meanOut (optional) receives the SIGNED mean residual -- the zoom-step signal:
+// a zoom change shifts the whole reconstruction, showing up as a sustained
+// nonzero mean while the wave averages near zero.
+static double WaterRmsVsCoef(const std::vector<float>& xyz, const double* baseline, float keepBand, const double coef[6], double* meanOut = nullptr)
+{
+	double se = 0.0, sr = 0.0; size_t cnt = 0;
+	const size_t n = xyz.size() / 3;
+	for (size_t i = 0; i < n; i++)
+	{
+		const float x = xyz[i * 3 + 0], y = xyz[i * 3 + 1], z = xyz[i * 3 + 2];
+		if (baseline && fabsf(y - WaterEvalCoef(baseline, x, z)) > keepBand) continue;
+		const double r = (double)y - (double)WaterEvalCoef(coef, x, z);
+		se += r * r; sr += r; cnt++;
+	}
+	if (meanOut) *meanOut = cnt ? (sr / (double)cnt) : 0.0;
+	return cnt ? sqrt(se / (double)cnt) : 0.0;
+}
+
+// Force ONE draw to additive blending so Remix treats the surface as emissive
+// (the torch-flame mechanism) -- the only way to make hash-unstable dynamic UI
+// self-lit. Applied AFTER SetDrawStates (so it wins), restored right after the
+// draw. Single-threaded draw path; static save-slots are safe (same pattern as
+// ToWorld_IntermediateGeometry).
+static bool sDynUiOverrideActive = false;
+static DWORD sDynUiOldAB = 0, sDynUiOldSrc = 0, sDynUiOldDst = 0;
+// Orphan-overlay lift (2026-06-12, menu-text fix): per-frame near-plane depth for
+// lifted overlay draws (constant-RHW + recipeless page = runtime-composited text).
+// Each lifted draw steps slightly nearer so painter's order (text over panels)
+// survives the inverse projection. Reset every BeginScene.
+static float g_orphanLiftZ = 0.05f;
+
+static void DynUiBeginDraw(LPDIRECT3DDEVICE9 dev)
+{
+	dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &sDynUiOldAB);
+	dev->GetRenderState(D3DRS_SRCBLEND, &sDynUiOldSrc);
+	dev->GetRenderState(D3DRS_DESTBLEND, &sDynUiOldDst);
+	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+	dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+	dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+	sDynUiOverrideActive = true;
+	NamekeyNoteDynUiDraw();
+}
+static void DynUiEndDraw(LPDIRECT3DDEVICE9 dev)
+{
+	if (!sDynUiOverrideActive) return;
+	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, sDynUiOldAB);
+	dev->SetRenderState(D3DRS_SRCBLEND, sDynUiOldSrc);
+	dev->SetRenderState(D3DRS_DESTBLEND, sDynUiOldDst);
+	sDynUiOverrideActive = false;
+}
+
+// Canonical Identity Layer (2026-06-09): defined in IDirectDrawSurfaceX.cpp.
+// Resolves a whole-surface texture's CONTENT to a frozen canonical texture
+// (loaded from _canonical\tex\<HASH>.a4r4) so Remix sees one stable,
+// offline-precomputed hash per content regardless of DK2's per-session
+// atlas-composition drift. Returns nullptr when no rebind applies.
+extern IDirect3DTexture9* Stage3CanonicalResolve(IDirect3DTexture9* d3d9Tex, LPDIRECT3DDEVICE9* d3d9Device);
+
 // ******************************
 // IUnknown functions
 // ******************************
@@ -1270,6 +1467,9 @@ HRESULT m_IDirect3DDeviceX::BeginScene()
 {
 	Logging::LogDebug() << __FUNCTION__ << " (" << this << ")";
 
+	// New frame: reset the orphan-overlay painter's-order depth.
+	g_orphanLiftZ = 0.05f;
+
 	if (Config.Dd7to9)
 	{
 		// Check for device interface
@@ -1395,6 +1595,13 @@ HRESULT m_IDirect3DDeviceX::EndScene()
 
 		ScopedCriticalSection ThreadLockDD(DdrawWrapper::GetDDCriticalSection());
 
+		// [BLITQUAD] menu-text fix: re-emit this frame's queued backbuffer blits
+		// (front-end UI/text composites) as lifted self-lit quads inside the scene.
+		if (Config.DdrawMenuBlitOverlay && d3d9Device && *d3d9Device)
+		{
+			MenuBlitOverlayDrain(this, *d3d9Device);
+		}
+
 		// Note: Camera matrices are now set in BeginScene (before draw calls)
 		// The EndScene code below is kept for Remix API (may not work on 32-bit through bridge)
 		if (Config.DdrawConvertHomogeneousToWorld)
@@ -1432,6 +1639,121 @@ HRESULT m_IDirect3DDeviceX::EndScene()
 
 			// Log atlas tracking at end of frame
 			m_IDirectDrawSurfaceX::LogAtlasTrackingAndReset();
+
+			// Water surface update (run-14 temporal fix -- see the block comment at
+			// the top of this file). Per frame: live fit (pass 1) -> reject skirts
+			// against it -> fold the kept verts' normalized normal equations into
+			// the temporal EMA -> solve the EMA for the SERVING surface. The wave
+			// (which the live fit tracks) averages out across phases in the EMA;
+			// a sustained live-vs-serve gap (real scene change) reseeds instead.
+			{
+				const size_t frameVerts = g_waterFrameXYZ.size() / 3;
+				if (frameVerts >= 48)
+				{
+					if (!g_waterSurfEpochSet)
+					{
+						// Fix the fit's coordinate frame on this epoch's water centroid and
+						// spread, so u,v stay O(1) (4th-order moments need the conditioning).
+						double sx = 0.0, sz = 0.0;
+						for (size_t i = 0; i < frameVerts; i++) { sx += g_waterFrameXYZ[i * 3]; sz += g_waterFrameXYZ[i * 3 + 2]; }
+						g_waterSurfCx = sx / (double)frameVerts;
+						g_waterSurfCz = sz / (double)frameVerts;
+						double sd = 0.0;
+						for (size_t i = 0; i < frameVerts; i++)
+						{
+							const double dx = g_waterFrameXYZ[i * 3] - g_waterSurfCx;
+							const double dz = g_waterFrameXYZ[i * 3 + 2] - g_waterSurfCz;
+							sd += dx * dx + dz * dz;
+						}
+						const double spread = sqrt(sd / (double)frameVerts);
+						g_waterSurfScale = (spread > 1e-3) ? (1.0 / spread) : 1.0;
+						g_waterSurfEpochSet = true;
+					}
+					double Af[6][6], bf[6], As[6][6], bs[6], pass1[6], live[6], serve[6];
+					bool haveLive = false;
+					size_t kept = 0;
+					if (WaterAccumNormals(g_waterFrameXYZ, nullptr, 0.0f, Af, bf))
+					{
+						memcpy(As, Af, sizeof(As)); memcpy(bs, bf, sizeof(bs));
+						if (WaterSolve6(As, bs, pass1))
+						{
+							const double rms1 = WaterRmsVsCoef(g_waterFrameXYZ, nullptr, 0.0f, pass1);
+							float rejBand = (float)(rms1 * 2.5);
+							if (rejBand < 0.25f) rejBand = 0.25f;
+							if (rejBand > 3.0f) rejBand = 3.0f;
+							kept = WaterAccumNormals(g_waterFrameXYZ, pass1, rejBand, Af, bf);
+							if (kept >= frameVerts / 4)
+							{
+								memcpy(As, Af, sizeof(As)); memcpy(bs, bf, sizeof(bs));
+								haveLive = WaterSolve6(As, bs, live);
+								if (haveLive)
+								{
+									// STATELESS ERA (2026-06-12, user directive "abandon that method"):
+									// the temporal EMA/step/sparse estimators chased the camera-
+									// dependent reconstruction with visible lag during cinematic and
+									// possession camera motion (water rose/fell for seconds). Serve
+									// the LIVE fit directly -- one frame of lag, ~16ms, camera-
+									// independent by construction. Trade-off accepted: water keeps
+									// the game's gentle swell, spatially smoothed (no chop, no seams).
+									memcpy(serve, live, sizeof(serve));
+									{
+										const double rmsServe = WaterRmsVsCoef(g_waterFrameXYZ, pass1, rejBand, serve);
+										for (int i = 0; i < 6; i++) g_waterSurfCoef[i] = serve[i];
+										g_waterSurfAgeFrames = 0;
+										float band = (float)(rmsServe * 4.0);
+										if (band < kWaterBandFloor) band = kWaterBandFloor;
+										if (band > kWaterBandCap) band = kWaterBandCap;
+										g_waterSurfBand = band;
+										g_waterSurfValid = true;
+										g_waterLvlPublishes++;
+										if (g_waterLvlPublishes <= 20 || (g_waterLvlPublishes % 600) == 0)
+										{
+											const DWORD snapPct = g_waterVertsTotal ? (g_waterVertsSnapped * 100 / g_waterVertsTotal) : 0;
+											char wbuf[300];
+											sprintf_s(wbuf, sizeof(wbuf), "[NAMEKEY] WATERSURF n=%lu c0=%.4f liveC0=%.4f cx=%.4f cz=%.4f cxx=%.5f cxz=%.5f czz=%.5f rmsServe=%.4f band=%.3f kept=%zu/%zu snap=%lu%% ymin=%.3f ymax=%.3f draws=%lu",
+												(unsigned long)g_waterLvlPublishes, g_waterSurfCoef[0], live[0], g_waterSurfCoef[1], g_waterSurfCoef[2],
+												g_waterSurfCoef[3], g_waterSurfCoef[4], g_waterSurfCoef[5],
+												rmsServe, band, kept, frameVerts, (unsigned long)snapPct,
+												g_waterFrameYMin, g_waterFrameYMax, (unsigned long)g_waterFrameDraws);
+											Logging::Log() << wbuf;
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				// frameVerts in (0, 48): sparse water (extreme close zoom / possession
+				// near a puddle). STATELESS ERA: no adaptation -- a fresh surface may
+				// serve briefly, but sustained sparseness AGES IT OUT so draws fall
+				// back to their own per-draw averages (always locally correct, no
+				// camera-chase possible).
+				else if (frameVerts > 0)
+				{
+					if (g_waterSurfValid && ++g_waterSurfAgeFrames > 10)
+					{
+						g_waterSurfValid = false;	// stale fit + moving camera = the chase artifact; let per-draw averages take over
+					}
+					double sy = 0.0;
+					for (size_t i = 0; i < frameVerts; i++) sy += g_waterFrameXYZ[i * 3 + 1];
+					static DWORD waterSparseSeen = 0;
+					waterSparseSeen++;
+					if (waterSparseSeen <= 40 || (waterSparseSeen % 300) == 0)
+					{
+						char sbuf[240];
+						sprintf_s(sbuf, sizeof(sbuf), "[NAMEKEY] WATERSPARSE n=%lu verts=%zu draws=%lu snapped=%lu yAvg=%.3f ymin=%.3f ymax=%.3f age=%lu surfValid=%d",
+							(unsigned long)waterSparseSeen, frameVerts, (unsigned long)g_waterFrameDraws,
+							(unsigned long)g_waterVertsSnapped, (float)(sy / (double)frameVerts),
+							g_waterFrameYMin, g_waterFrameYMax,
+							(unsigned long)g_waterSurfAgeFrames, g_waterSurfValid ? 1 : 0);
+						Logging::Log() << sbuf;
+					}
+				}
+				g_waterFrameXYZ.clear();
+				g_waterFrameDraws = 0;
+				g_waterVertsTotal = 0;
+				g_waterVertsSnapped = 0;
+			}
 		}
 
 		return hr;
@@ -2949,6 +3271,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 		// projection so Remix sees pure XYZRHW screen-space verts and can render it as
 		// a 2D overlay rather than path-traced world geometry.
 		bool isUIPassthrough = false;
+		bool dynUiEmissiveDraw = false;
+		bool orphanOverlayDraw = false;
 		float uiHeuristicMinRHW = 0.0f, uiHeuristicMaxRHW = 0.0f;
 		if ((dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW && dwVertexCount > 0 && lpVertices)
 		{
@@ -2963,12 +3287,14 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 				if (rhw > uiHeuristicMaxRHW) uiHeuristicMaxRHW = rhw;
 			}
 			const float denom = (uiHeuristicMaxRHW > 0.0f) ? uiHeuristicMaxRHW : 1.0f;
-			isUIPassthrough = ((uiHeuristicMaxRHW - uiHeuristicMinRHW) / denom) < 1e-4f;
+			const bool isConstantRHW = ((uiHeuristicMaxRHW - uiHeuristicMinRHW) / denom) < 1e-4f;
+			isUIPassthrough = isConstantRHW;
 			// [may20-minus-mip] DISABLED: the UI-passthrough heuristic classified
 			// constant-RHW torch billboards as UI -> they skipped the world inverse
 			// projection -> torches vanish by angle/distance under Remix. OG (pre-May-2)
 			// projected ALL XYZRHW draws. Force false to restore that baseline.
 			isUIPassthrough = false;
+			orphanOverlayDraw = Config.DdrawOrphanOverlayLift && isConstantRHW;
 
 			// === Phase A.8 (atlas decomposition prep): UV bounds for stage 0 ===
 			// Each drawcall samples a sub-rectangle of the bound atlas. Aggregating
@@ -3005,6 +3331,44 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 				<< " rhw=[" << uiHeuristicMinRHW << "," << uiHeuristicMaxRHW << "]"
 				<< " tex=" << uiTexPtr
 				<< (has_uv ? (std::string(" uv=[") + std::to_string(u_min) + "," + std::to_string(v_min) + "," + std::to_string(u_max) + "," + std::to_string(v_max) + "]").c_str() : ""));
+
+			// Dynamic-UI emissive: DrawPrimitive has no decompose probe, so only the
+			// recipe-level (solo runtime-rendered page, e.g. the minimap) check applies.
+			NamekeyResetDrawDynUi();
+			dynUiEmissiveDraw = Config.DdrawDynamicUiEmissive &&
+				CurrentTextureSurfaceX[0] && CurrentTextureSurfaceX[0]->IsNamekeyDynamicUiPage();
+
+			// Orphan-overlay lift (2026-06-12, menu-text fix): a constant-RHW quad
+			// binding a RECIPELESS page (content never sourced from the tracked
+			// EngineTextures upload = runtime-composited text/overlay, e.g. front-end
+			// menu labels) is invisible under the inverse projection: its screen z
+			// buries it inside the path-traced backdrop and no scene light reaches it
+			// (floodlight-tested 2026-06-12). Lift it to a fixed near depth and draw
+			// it additive (self-lit). Recipe-bearing pages (torch billboards etc.) are
+			// excluded by construction -- this cannot re-run the May-20 passthrough
+			// regression. See dk2_menu_res_port memory.
+			orphanOverlayDraw = orphanOverlayDraw &&
+				((CurrentTextureSurfaceX[0] && CurrentTextureSurfaceX[0]->IsNamekeyOrphanPage()) || MenuBlitOverlayDrawActive());
+			if (orphanOverlayDraw) dynUiEmissiveDraw = true;
+
+			// [LIFT] telemetry v2 (own budget): constant-RHW draws ONLY -- the
+			// orphan-page OR-branch flooded the budget in 2.6s (the front-end's 3D
+			// backdrop binds recipe-less textures wholesale, so "orphan" is the NORM
+			// there, not a discriminator). Recipe names identify what kind of page
+			// each overlay draw binds (font/text pages vs sprite pages).
+			if (Config.DdrawOrphanOverlayLift && isConstantRHW)
+			{
+				char recipeBrief[256];
+				if (CurrentTextureSurfaceX[0]) CurrentTextureSurfaceX[0]->GetNamekeyRecipeBrief(recipeBrief, sizeof(recipeBrief));
+				else strcpy_s(recipeBrief, sizeof(recipeBrief), "notex");
+				LOG_LIMIT(100000, "[LIFT] DrawPrimitive " << (orphanOverlayDraw ? "LIFTED" : "skip")
+					<< " tex=" << (void*)CurrentTextureSurfaceX[0]
+					<< " recipe=" << recipeBrief
+					<< " vcount=" << dwVertexCount
+					<< " rhw=" << uiHeuristicMinRHW
+					<< " srcz=" << ((const float*)lpVertices)[2]
+					<< " liftz=" << g_orphanLiftZ);
+			}
 		}
 
 		// Handle PositionT (pre-transformed vertices) - convert to world space for RTX Remix
@@ -3049,7 +3413,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 					float* srcpos = (float*)sourceVertex;
 					float* trgtpos = (float*)targetVertex;
 
-					DirectX::XMVECTOR xpos = DirectX::XMVectorSet(srcpos[0], srcpos[1], srcpos[2], srcpos[3]);
+					DirectX::XMVECTOR xpos = DirectX::XMVectorSet(srcpos[0], srcpos[1],
+						orphanOverlayDraw ? g_orphanLiftZ : srcpos[2], srcpos[3]);
 					DirectX::XMVECTOR xpos_global = DirectX::XMVector3TransformCoord(xpos, ConvertHomogeneous.ToWorld_ViewMatrixInverse);
 					xpos_global = DirectX::XMVectorDivide(xpos_global, DirectX::XMVectorSplatW(xpos_global));
 
@@ -3064,6 +3429,10 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 					sourceVertex += stride;
 					targetVertex += targetStride;
 				}
+
+				// Painter's order for lifted overlays: the next lifted draw sits
+				// slightly nearer so later draws (text over panels) resolve on top.
+				if (orphanOverlayDraw && g_orphanLiftZ > 0.01f) g_orphanLiftZ -= 1e-5f;
 
 				// Set transform
 				(*d3d9Device)->SetTransform(D3DTS_VIEW, &ConvertHomogeneous.ToWorld_ViewMatrix);
@@ -3082,8 +3451,17 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 				// Handle dwFlags
 				SetDrawStates(newVertexTypeDesc, dwFlags, DirectXVersion);
 
-				// Draw primitive UP
+				// [BLITQUAD]: bind the overlay texture AFTER SetDrawStates (whose texture
+				// loop rebinds the game's CurrentTexture state and would stomp it).
+				if (IDirect3DTexture9* overlayTex = MenuBlitOverlayCurrentTex())
+				{
+					(*d3d9Device)->SetTexture(0, overlayTex);
+				}
+
+				// Draw primitive UP (dynamic-UI draws get the additive/emissive override)
+				if (dynUiEmissiveDraw) DynUiBeginDraw(*d3d9Device);
 				HRESULT hr = (*d3d9Device)->DrawPrimitiveUP(dptPrimitiveType, GetNumberOfPrimitives(dptPrimitiveType, dwVertexCount), lpVertices, targetStride);
+				DynUiEndDraw(*d3d9Device);
 
 				// Handle dwFlags
 				RestoreDrawStates(hr, newVertexTypeDesc, dwFlags);
@@ -3102,8 +3480,16 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 		// Handle dwFlags
 		SetDrawStates(dwVertexTypeDesc, dwFlags, DirectXVersion);
 
-		// Draw primitive UP
+		// [BLITQUAD]: bind the overlay texture AFTER SetDrawStates (see converted branch).
+		if (IDirect3DTexture9* overlayTex = MenuBlitOverlayCurrentTex())
+		{
+			(*d3d9Device)->SetTexture(0, overlayTex);
+		}
+
+		// Draw primitive UP (dynamic-UI draws get the additive/emissive override)
+		if (dynUiEmissiveDraw) DynUiBeginDraw(*d3d9Device);
 		HRESULT hr = (*d3d9Device)->DrawPrimitiveUP(dptPrimitiveType, GetNumberOfPrimitives(dptPrimitiveType, dwVertexCount), lpVertices, GetVertexStride(dwVertexTypeDesc));
+		DynUiEndDraw(*d3d9Device);
 
 		// Handle dwFlags
 		RestoreDrawStates(hr, dwFlags, DirectXVersion);
@@ -3134,6 +3520,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 	}
 }
 
+
+
 HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWORD dwVertexTypeDesc, LPVOID lpVertices, DWORD dwVertexCount, LPWORD lpwIndices, DWORD dwIndexCount, DWORD dwFlags, DWORD DirectXVersion)
 {
 	Logging::LogDebug() << __FUNCTION__ << " (" << this << ")" <<
@@ -3157,6 +3545,7 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 		{
 			return DDERR_INVALIDPARAMS;
 		}
+
 
 		if (DirectXVersion == 2)
 		{
@@ -3196,6 +3585,9 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 		float adRegU0 = 0.0f, adRegV0 = 0.0f, adRegDu = 1.0f, adRegDv = 1.0f;
 		int adRegIdx = -1;
 		UINT atlasDecomposeUVOffBase = 0;
+		bool dynUiEmissiveDraw = false;
+		bool waterFlattenDraw = false;
+		bool orphanOverlayDraw = false;
 		if ((dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW && dwVertexCount > 0 && lpVertices)
 		{
 			const UINT scanStride = GetVertexStride(dwVertexTypeDesc);
@@ -3209,12 +3601,14 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 				if (rhw > uiHeuristicMaxRHW) uiHeuristicMaxRHW = rhw;
 			}
 			const float denom = (uiHeuristicMaxRHW > 0.0f) ? uiHeuristicMaxRHW : 1.0f;
-			isUIPassthrough = ((uiHeuristicMaxRHW - uiHeuristicMinRHW) / denom) < 1e-4f;
+			const bool isConstantRHW = ((uiHeuristicMaxRHW - uiHeuristicMinRHW) / denom) < 1e-4f;
+			isUIPassthrough = isConstantRHW;
 			// [may20-minus-mip] DISABLED: the UI-passthrough heuristic classified
 			// constant-RHW torch billboards as UI -> they skipped the world inverse
 			// projection -> torches vanish by angle/distance under Remix. OG (pre-May-2)
 			// projected ALL XYZRHW draws. Force false to restore that baseline.
 			isUIPassthrough = false;
+			orphanOverlayDraw = Config.DdrawOrphanOverlayLift && isConstantRHW;
 
 			// Phase A.8: same UV-bounds scan as DrawPrimitive site (see comment there)
 			float u_min = 0, u_max = 0, v_min = 0, v_max = 0;
@@ -3249,6 +3643,11 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 				<< " tex=" << uiTexPtr
 				<< (has_uv ? (std::string(" uv=[") + std::to_string(u_min) + "," + std::to_string(v_min) + "," + std::to_string(u_max) + "," + std::to_string(v_max) + "]").c_str() : ""));
 
+
+			// Dynamic-UI emissive: clear the per-draw classification before the
+			// decompose probes (TryGetUniversalSubTextureForUV sets it).
+			NamekeyResetDrawDynUi();
+
 			// Phase A.10: probe the atlas-region map for this drawcall. Match by
 			// content hash (stable across sessions) + UV bbox containment (with
 			// rasterizer-rounding slack). On a hit, the synthesized sub-texture
@@ -3259,6 +3658,77 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 				CurrentTextureSurfaceX[0]->TryGetSubTextureForUV(u_min, v_min, u_max, v_max,
 					atlasDecomposeSubTex, adRegU0, adRegV0, adRegDu, adRegDv, adRegIdx);
 			}
+
+			// Universal UV-region decomposition (2026-05-21): for ANY drawcall whose
+			// stage-0 UV bbox is a PROPER sub-rectangle of its bound texture, crop that
+			// exact region into a content-hash-keyed sub-texture and bind it. Full-texture
+			// draws (dirt walls, UV ~ [0,1]) fail the area gate and pass through untouched,
+			// which structurally eliminates both the wall over-match AND the co-atlas flash
+			// (the torch flame then samples ONLY the flame region, never flame+HUD). No
+			// fingerprints, no hardcoded hashes. Reuses the A.10 UV-rewrite + SetTexture
+			// override below. Mutually exclusive with the A.10 path above (only fires if
+			// A.10 didn't already match). See dk2_universal_decompose_plan memory.
+			constexpr float kUnivMinArea = 1e-5f;   // reject degenerate/zero-area UV bboxes
+			constexpr float kUnivMaxArea = 0.5f;     // only decompose proper sub-rects (tune)
+			// VERTEX-COUNT GATE (2026-05-21): only decompose small sprite/billboard-like
+			// draws. Co-atlased torches are tiny meshes (~12 verts). A COMPLEX world mesh
+			// (115 verts) whose UV bbox merely happens to be a sub-rect is NOT a uniform
+			// quad -- rewriting all its UVs to [0,1] over the bbox + binding a cropped NPOT
+			// sub-texture produced geometry that CRASHED the Remix server (0xC0000005 AV in
+			// its geometry/BVH path; vcount=115 draw, see dk2_universal_decompose_plan).
+			// 32 sits well above the 12-vert torch and well below the 115-vert mesh.
+			constexpr UINT kUnivMaxVertexCount = 32;
+			// Gate-free water classification (run 11): large water bodies are 34-340
+			// vert meshes whose UV bbox sits inside ONE Water placement -- ask the
+			// page recipe directly, before the gates. Drives the flatten always; with
+			// DdrawWaterCropLarge it also lets these draws through the vcount gate so
+			// they get the collapsed translucent crop instead of the whole page (the
+			// crops here are POT 32x32 and the UVs verified-contained, unlike the
+			// NPOT case in the historic 115-vert Remix AV).
+			const bool waterRecipeDraw = Config.DdrawWaterFlatten && has_uv && CurrentTextureSurfaceX[0] &&
+				CurrentTextureSurfaceX[0]->IsNamekeyWaterDraw(u_min, v_min, u_max, v_max);
+			if (!atlasDecomposeSubTex && Config.DdrawUniversalDecompose && has_uv && CurrentTextureSurfaceX[0]
+				&& (dwVertexCount <= kUnivMaxVertexCount || (waterRecipeDraw && Config.DdrawWaterCropLarge)))
+			{
+				const float uvArea = (u_max - u_min) * (v_max - v_min);
+				if (uvArea > kUnivMinArea && uvArea < kUnivMaxArea)
+				{
+					CurrentTextureSurfaceX[0]->TryGetUniversalSubTextureForUV(u_min, v_min, u_max, v_max,
+						atlasDecomposeSubTex, adRegU0, adRegV0, adRegDu, adRegDv, adRegIdx);
+				}
+			}
+
+			// Dynamic-UI emissive: placement-level flag (set during the probe above)
+			// OR recipe-level solo page (minimap-class full-page draws that never
+			// enter the crop layer).
+			dynUiEmissiveDraw = Config.DdrawDynamicUiEmissive &&
+				(NamekeyGetDrawDynUi() || (CurrentTextureSurfaceX[0] && CurrentTextureSurfaceX[0]->IsNamekeyDynamicUiPage()));
+
+			// Orphan-overlay lift (2026-06-12, menu-text fix) -- see the DrawPrimitive
+			// site for the full rationale: constant-RHW + recipeless page = runtime-
+			// composited overlay (menu text); lift to near depth + draw additive.
+			orphanOverlayDraw = orphanOverlayDraw &&
+				((CurrentTextureSurfaceX[0] && CurrentTextureSurfaceX[0]->IsNamekeyOrphanPage()) || MenuBlitOverlayDrawActive());
+			if (orphanOverlayDraw) dynUiEmissiveDraw = true;
+
+			// [LIFT] telemetry v2 -- see the DrawPrimitive site.
+			if (Config.DdrawOrphanOverlayLift && isConstantRHW)
+			{
+				char recipeBrief[256];
+				if (CurrentTextureSurfaceX[0]) CurrentTextureSurfaceX[0]->GetNamekeyRecipeBrief(recipeBrief, sizeof(recipeBrief));
+				else strcpy_s(recipeBrief, sizeof(recipeBrief), "notex");
+				LOG_LIMIT(100000, "[LIFT] DrawIndexedPrimitive " << (orphanOverlayDraw ? "LIFTED" : "skip")
+					<< " tex=" << (void*)CurrentTextureSurfaceX[0]
+					<< " recipe=" << recipeBrief
+					<< " vcount=" << dwVertexCount
+					<< " rhw=" << uiHeuristicMinRHW
+					<< " srcz=" << ((const float*)lpVertices)[2]
+					<< " liftz=" << g_orphanLiftZ);
+			}
+
+			// Water flatten: this draw samples a WaterN placement -> snap its world
+			// heights after the inverse projection below (the game waves the verts).
+			waterFlattenDraw = Config.DdrawWaterFlatten && (waterRecipeDraw || NamekeyGetDrawWater());
 		}
 
 		// Handle PositionT
@@ -3319,7 +3789,8 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 					float* srcpos = (float*)sourceVertex;
 					float* trgtpos = (float*)targetVertex;
 
-					DirectX::XMVECTOR xpos = DirectX::XMVectorSet(srcpos[0], srcpos[1], srcpos[2], srcpos[3]);
+					DirectX::XMVECTOR xpos = DirectX::XMVectorSet(srcpos[0], srcpos[1],
+						orphanOverlayDraw ? g_orphanLiftZ : srcpos[2], srcpos[3]);
 
 					DirectX::XMVECTOR xpos_global = DirectX::XMVector3TransformCoord(xpos, ConvertHomogeneous.ToWorld_ViewMatrixInverse);
 
@@ -3335,6 +3806,79 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 					// Move to next vertex
 					sourceVertex += stride;
 					targetVertex += targetStride;
+				}
+
+				// Painter's order for lifted overlays: the next lifted draw sits
+				// slightly nearer so later draws (text over panels) resolve on top.
+				if (orphanOverlayDraw && g_orphanLiftZ > 0.01f) g_orphanLiftZ -= 1e-5f;
+
+				// Water flatten (2026-06-11, surface-fit era -- see the block comment
+				// at the top of this file): the game waves the water verts every
+				// frame; under translucent path-traced water the bobbing churns
+				// refraction/reflection. Feed this draw's RAW world verts to the
+				// frame accumulator (the fit must see the live sine, not our own
+				// output), then snap each vert to LAST frame's fitted surface
+				// evaluated at its own (x,z). Verts beyond the snap band (shore
+				// skirts, stray geometry) keep their height. Cold start (first
+				// water frame after a 5s gap): per-draw average for one frame.
+				if (waterFlattenDraw && dwVertexCount >= 3)
+				{
+					UINT8* tv = (UINT8*)ConvertHomogeneous.ToWorld_IntermediateGeometry.data();
+					float ySum = 0.0f;
+					float yMin = ((float*)tv)[1], yMax = yMin;
+					for (UINT vi = 0; vi < dwVertexCount; vi++)
+					{
+						const float y = ((float*)(tv + vi * targetStride))[1];
+						ySum += y;
+						if (y < yMin) yMin = y;
+						if (y > yMax) yMax = y;
+					}
+					const DWORD nowWaterMs = GetTickCount();
+					if (nowWaterMs - g_waterLastDrawMs > 5000)
+					{
+						g_waterSurfValid = false;	// loading gap / map change: stale surface
+						g_waterSurfEpochSet = false;
+						g_waterSurfAgeFrames = 0;
+						g_waterFrameXYZ.clear();
+						g_waterFrameDraws = 0;
+						g_waterVertsTotal = 0;
+						g_waterVertsSnapped = 0;
+					}
+					g_waterLastDrawMs = nowWaterMs;
+					if (g_waterFrameXYZ.empty()) { g_waterFrameYMin = yMin; g_waterFrameYMax = yMax; }
+					else
+					{
+						if (yMin < g_waterFrameYMin) g_waterFrameYMin = yMin;
+						if (yMax > g_waterFrameYMax) g_waterFrameYMax = yMax;
+					}
+					for (UINT vi = 0; vi < dwVertexCount && g_waterFrameXYZ.size() < kWaterFrameVertCap * 3; vi++)
+					{
+						const float* pos = (const float*)(tv + vi * targetStride);
+						g_waterFrameXYZ.push_back(pos[0]);
+						g_waterFrameXYZ.push_back(pos[1]);
+						g_waterFrameXYZ.push_back(pos[2]);
+					}
+					g_waterFrameDraws++;
+					g_waterVertsTotal += dwVertexCount;
+					if (g_waterSurfValid)
+					{
+						for (UINT vi = 0; vi < dwVertexCount; vi++)
+						{
+							float* pos = (float*)(tv + vi * targetStride);
+							const float s = WaterSurfEval(pos[0], pos[2]);
+							if (fabsf(pos[1] - s) <= g_waterSurfBand) { pos[1] = s; g_waterVertsSnapped++; }
+						}
+					}
+					else
+					{
+						const float yAvg = ySum / (float)dwVertexCount;
+						for (UINT vi = 0; vi < dwVertexCount; vi++)
+						{
+							((float*)(tv + vi * targetStride))[1] = yAvg;
+						}
+						g_waterVertsSnapped += dwVertexCount;
+					}
+					NamekeyNoteWaterFlatten();
 				}
 
 				// Set transform
@@ -3375,10 +3919,13 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 				if (atlasDecomposeSubTex)
 				{
 					(*d3d9Device)->SetTexture(0, atlasDecomposeSubTex);
+					Stage3OnRemixBind(atlasDecomposeSubTex, /*isCrop=*/true);
 				}
 
-				// Draw indexed primitive UP
+				// Draw indexed primitive UP (dynamic-UI draws get the additive/emissive override)
+				if (dynUiEmissiveDraw) DynUiBeginDraw(*d3d9Device);
 				HRESULT hr = (*d3d9Device)->DrawIndexedPrimitiveUP(dptPrimitiveType, 0, dwVertexCount, GetNumberOfPrimitives(dptPrimitiveType, dwIndexCount), lpwIndices, D3DFMT_INDEX16, lpVertices, targetStride);
+				DynUiEndDraw(*d3d9Device);
 
 				// Handle dwFlags
 				RestoreDrawStates(hr, newVertexTypeDesc, dwFlags);
@@ -3425,10 +3972,13 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 		if (atlasDecomposeSubTex)
 		{
 			(*d3d9Device)->SetTexture(0, atlasDecomposeSubTex);
+			Stage3OnRemixBind(atlasDecomposeSubTex, /*isCrop=*/true);
 		}
 
-		// Draw indexed primitive UP
+		// Draw indexed primitive UP (dynamic-UI draws get the additive/emissive override)
+		if (dynUiEmissiveDraw) DynUiBeginDraw(*d3d9Device);
 		HRESULT hr = (*d3d9Device)->DrawIndexedPrimitiveUP(dptPrimitiveType, 0, dwVertexCount, GetNumberOfPrimitives(dptPrimitiveType, dwIndexCount), lpwIndices, D3DFMT_INDEX16, lpVertices, GetVertexStride(dwVertexTypeDesc));
+		DynUiEndDraw(*d3d9Device);
 
 		// Handle dwFlags
 		RestoreDrawStates(hr, dwFlags, DirectXVersion);
@@ -3599,6 +4149,16 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveStrided(D3DPRIMITIVETYPE dptPrimitiveTy
 			return DDERR_INVALIDPARAMS;
 		}
 
+		// Menu-text fix (2026-06-12) -- same gap as the VB path: strided XYZRHW draws
+		// bypassed the XYZRHW->world conversion. Funnel through the user-pointer path
+		// (LOCAL copy: the UP path's UpdateVertices may itself write into VertexCache).
+		if (Config.DdrawConvertHomogeneousW && (dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW)
+		{
+			std::vector<BYTE> stridedCopy(VertexCache.begin(), VertexCache.begin() + dwVertexCount * GetVertexStride(dwVertexTypeDesc));
+			LOG_LIMIT(100, __FUNCTION__ << " rerouting XYZRHW strided draw through UP path (menu-text fix)");
+			return DrawPrimitive(dptPrimitiveType, dwVertexTypeDesc, stridedCopy.data(), dwVertexCount, dwFlags, DirectXVersion);
+		}
+
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(dwVertexTypeDesc)))
 		{
@@ -3697,6 +4257,16 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitiveStrided(D3DPRIMITIVETYPE dptPrim
 			return DDERR_INVALIDPARAMS;
 		}
 
+		// Menu-text fix (2026-06-12) -- same gap as the VB path: strided XYZRHW draws
+		// bypassed the XYZRHW->world conversion. Funnel through the user-pointer path
+		// (LOCAL copy: the UP path's UpdateVertices may itself write into VertexCache).
+		if (Config.DdrawConvertHomogeneousW && (dwVertexTypeDesc & 0x0E) == D3DFVF_XYZRHW)
+		{
+			std::vector<BYTE> stridedCopy(VertexCache.begin(), VertexCache.begin() + dwVertexCount * GetVertexStride(dwVertexTypeDesc));
+			LOG_LIMIT(100, __FUNCTION__ << " rerouting XYZRHW strided draw through UP path (menu-text fix)");
+			return DrawIndexedPrimitive(dptPrimitiveType, dwVertexTypeDesc, stridedCopy.data(), dwVertexCount, lpwIndices, dwIndexCount, dwFlags, DirectXVersion);
+		}
+
 		// Handle dwFlags
 		SetDrawStates(dwVertexTypeDesc, dwFlags, DirectXVersion);
 
@@ -3783,6 +4353,25 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 		}
 
 		DWORD FVF = pVertexBufferX->GetFVF9();
+
+		// Menu-text fix (2026-06-12): XYZRHW VB draws bypassed the XYZRHW->world
+		// conversion entirely and reached Remix as raw screen-space geometry --
+		// invisible in the path-traced scene (the front-end menu text draws this
+		// way; orthographicIsUI=True rasterized it, proving the content is fine).
+		// Reroute through the user-pointer draw path, which applies the inverse
+		// projection and ALL draw classification (orphan lift, decompose, telemetry).
+		// The wrapper keeps a CPU-side copy of every VB, so this reads cached memory.
+		if (Config.DdrawConvertHomogeneousW && (FVF & 0x0E) == D3DFVF_XYZRHW)
+		{
+			const BYTE* vbData = pVertexBufferX->GetCpuVertexData();
+			const UINT vbStride = GetVertexStride(FVF);
+			if (vbData && pVertexBufferX->GetCpuVertexDataSize() >= (dwStartVertex + dwNumVertices) * vbStride)
+			{
+				LOG_LIMIT(100, __FUNCTION__ << " rerouting XYZRHW VB draw through UP path (menu-text fix)");
+				return DrawPrimitive(dptPrimitiveType, FVF,
+					(LPVOID)(vbData + dwStartVertex * vbStride), dwNumVertices, dwFlags, DirectXVersion);
+			}
+		}
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(FVF)))
@@ -3887,6 +4476,21 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitiveVB(D3DPRIMITIVETYPE dptPrimitive
 		}
 
 		DWORD FVF = pVertexBufferX->GetFVF9();
+
+		// Menu-text fix (2026-06-12) -- see DrawPrimitiveVB: reroute XYZRHW VB draws
+		// through the user-pointer path for the world conversion + classification.
+		if (Config.DdrawConvertHomogeneousW && (FVF & 0x0E) == D3DFVF_XYZRHW)
+		{
+			const BYTE* vbData = pVertexBufferX->GetCpuVertexData();
+			const UINT vbStride = GetVertexStride(FVF);
+			if (vbData && pVertexBufferX->GetCpuVertexDataSize() >= (dwStartVertex + dwNumVertices) * vbStride)
+			{
+				LOG_LIMIT(100, __FUNCTION__ << " rerouting XYZRHW VB draw through UP path (menu-text fix)");
+				return DrawIndexedPrimitive(dptPrimitiveType, FVF,
+					(LPVOID)(vbData + dwStartVertex * vbStride), dwNumVertices,
+					lpwIndices, dwIndexCount, dwFlags, DirectXVersion);
+			}
+		}
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(FVF)))
@@ -6882,7 +7486,13 @@ void m_IDirect3DDeviceX::SetDrawStates(DWORD dwVertexTypeDesc, DWORD& dwFlags, D
 			IDirect3DTexture9* pTexture9 = effective->GetD3d9Texture();
 			if (pTexture9)
 			{
+				// Canonical Identity Layer: converge drifting pool/atlas-composite
+				// content onto frozen canonical textures so Remix sees one stable
+				// hash per content (no-op when DdrawCanonicalRebind=0).
+				IDirect3DTexture9* canonTex = Stage3CanonicalResolve(pTexture9, d3d9Device);
+				if (canonTex) pTexture9 = canonTex;
 				(*d3d9Device)->SetTexture(x, pTexture9);
+				Stage3OnRemixBind(pTexture9, /*isCrop=*/false);
 				// Phase A.7 v2: capture content at first bind for static textures
 				// (loaded once at init and never re-dirtied -- SetDirtyFlag hook
 				// misses these). Internal dedup makes this one-shot per surface.
@@ -6910,7 +7520,9 @@ void m_IDirect3DDeviceX::SetDrawStates(DWORD dwVertexTypeDesc, DWORD& dwFlags, D
 			if (CurrentTextureSurfaceX[x] && CurrentTextureSurfaceX[x]->IsColorKeyTexture() && CurrentTextureSurfaceX[x]->GetD3d9DrawTexture())
 			{
 				dwFlags |= D3DDP_DXW_ALPHACOLORKEY;
-				(*d3d9Device)->SetTexture(x, CurrentTextureSurfaceX[x]->GetD3d9DrawTexture());
+				LPDIRECT3DTEXTURE9 ckDrawTex = CurrentTextureSurfaceX[x]->GetD3d9DrawTexture();
+				(*d3d9Device)->SetTexture(x, ckDrawTex);
+				Stage3OnRemixBind(ckDrawTex, /*isCrop=*/false);
 			}
 		}
 		if (dwFlags & D3DDP_DXW_ALPHACOLORKEY)
