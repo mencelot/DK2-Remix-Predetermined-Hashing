@@ -161,6 +161,11 @@ private:
 		bool IsDirtyFlag = false;
 		bool IsDrawTextureDirty = false;
 		bool IsPaletteDirty = false;						// Used to detect if the palette surface needs to be updated
+		DWORD LastBltTimeMs = 0;							// GetTickCount() at the last mip-0 dirty event. Used by SetDirtyFlag to compute the gap-since-previous-Blt for repurpose detection.
+		DWORD RepurposeGen = 0;								// Per-surface "repurpose generation" counter. Bumped by SetDirtyFlag only when a Blt arrives after >kRepurposeIdleGapMs of idle (signature of a sprite-repurpose, not an animation frame). Cached universal-decompose entries record the gen at insert time; on hit, mismatch -> invalidate. Replaces the cruder time-since-cache gate (was firing on long-running animations and missing fast-cadence repurposes).
+		DWORD UnivCropCount = 0;							// Cumulative count of sub-textures we've synthesized FROM this surface. Used to detect streaming-buffer surfaces (genuine atlases produce few sub-textures; streaming buffers produce thousands of nearly-all-unique rects).
+		DWORD UnivCheckpointStartMs = 0;					// GetTickCount() at the start of the current 256-crop measurement window. Reset after each window's rate check so late-emerging streamers (a surface that becomes a streamer only during late-game) still trip the blacklist (Phase 6).
+		bool UnivSkipDecompose = false;						// Set once a surface has been classified as a streaming buffer (high crop rate, mostly-unique rects). Once set, the universal-decompose fast-paths early-exit and the caller falls back to the original full surface texture.
 		DWORD BitCount = 0;									// Bit count for this surface
 		D3DFORMAT Format = D3DFMT_UNKNOWN;					// Format for this surface
 		DWORD Width = 0;									// Width surface/texture was created with
@@ -492,7 +497,20 @@ public:
 	void ReleaseD9Surface(bool BackupData, bool ResetSurface);
 	HRESULT PresentSurface(LPRECT lpDestRect, bool IsSkipScene);
 	void ResetSurfaceDisplay();
-	void SetDirtyFlag(DWORD MipMapLevel);
+	void SetDirtyFlag(DWORD MipMapLevel, const RECT* dirtyRect = nullptr);  // Phase 7: dirtyRect (when known) is recorded into BltHistory for per-rect cache invalidation. nullptr -> conservative "whole surface dirty" entry.
+	void RecordBltRect(const RECT* dirtyRect);				// Phase 7: push a (rect, time) entry into BltHistory ring buffer. nullptr -> whole surface rect. Called from SetDirtyFlag and directly from any code path that knows it modified a specific region.
+
+	// Phase 7 (2026-05-24): per-Blt rect tracking ring buffer. Every successful Blt/BltFast/
+	// Unlock pushes its dest/locked rect + timestamp here (via SetDirtyFlag -> RecordBltRect).
+	// The universal-decompose cache hit path scans this buffer for (timestamp > cachedAtTimeMs
+	// && rect overlaps cached UV rect) to detect per-rect repurposes that the per-surface
+	// RepurposeGen gate misses (when the surface is re-Blt'd continuously with <1s gaps but
+	// the CONTENT at a specific rect changed). At class scope (not inside the `surface`
+	// inner struct) because it's dxwrapper-side state, not D3D surface descriptor data.
+	struct BltHistEntry { LONG x0; LONG y0; LONG x1; LONG y1; DWORD timeMs; };
+	static const int kBltHistorySize = 16;
+	BltHistEntry BltHistory[kBltHistorySize] = {};
+	int BltHistoryHead = 0;
 	void EndWritePresent(LPRECT lpDestRect, bool IsSkipScene);
 
 	// Surface information functions
@@ -536,6 +554,48 @@ public:
 		float& regionU0Out, float& regionV0Out,
 		float& regionDuOut, float& regionDvOut,
 		int& regionIdxOut);
+	// Universal UV-region decomposition (2026-05-21): crop the drawcall's exact sampled
+	// UV sub-rectangle into a content-hash-keyed sub-texture (no fingerprints/hashes/PNGs).
+	// Same out-params/contract as TryGetSubTextureForUV. Gated by DdrawUniversalDecompose;
+	// caller applies the area gate before calling. Returns false if not a usable sub-rect.
+	bool TryGetUniversalSubTextureForUV(float u_min, float v_min, float u_max, float v_max,
+		IDirect3DTexture9*& subTexOut,
+		float& regionU0Out, float& regionV0Out,
+		float& regionDuOut, float& regionDvOut,
+		int& regionIdxOut);
+	// Dynamic-UI emissive (2026-06-11): true when this page's recipe is a SOLO
+	// runtime-rendered UI surface (map_texture etc.) -- the device draw sites apply
+	// the additive blend override to its full-page draws (which never enter the
+	// crop layer where per-placement classification happens).
+	bool IsNamekeyDynamicUiPage();
+	// Orphan page = no recipe ever attached: content was runtime-rendered (text
+	// composited by MyTextRenderer, loading bars) rather than blitted from tracked
+	// EngineTextures staging. Device draw sites combine this with the constant-RHW
+	// test to classify screen-space overlay draws (orphan-overlay lift, 2026-06-12).
+	bool IsNamekeyOrphanPage();
+	// [LIFT] diagnostics: write a brief recipe description ("none", "notex", or up to
+	// 3 distinct placement names + counts) into buf. Identifies what kind of page a
+	// constant-RHW overlay draw is binding (font/text pages vs sprite pages).
+	void GetNamekeyRecipeBrief(char* buf, size_t bufSize);
+	// [BLITQUAD] (2026-06-12, menu-text fix): called on the DEST surface of a
+	// successful Blt onto the backbuffer/primary. Copies the blitted source region
+	// into a cached overlay texture and queues {texture, destRect} for the device to
+	// re-emit as a lifted quad at EndScene (the path tracer discards CPU-composited
+	// backbuffer content -- this is how the front-end menu text becomes visible).
+	void MenuBlitOverlayQueue(m_IDirectDrawSurfaceX* pSrc, LPRECT lpSrcRect, LPRECT lpDestRect, bool hasSrcKey, DWORD nativeSrcKey);
+	// [BLITQUAD] v2: the menu TEXT is software-rendered into the backbuffer via Lock
+	// writes (MENUDIAG: 681/visit) -- capture the emulated backbuffer as one full-frame
+	// overlay quad whenever it was dirtied by a write-lock.
+	void MenuBlitOverlayCaptureLockedFrame();
+	// [BLITQUAD] v3: the backbuffer is NOT emulated (v2 capture found no mirror) --
+	// the game's glyph writes go through direct d3d9 locks. Called from Unlock while
+	// the mapping is still valid: copies the written bits into an overlay texture.
+	void MenuBlitOverlayCaptureLockedBits(void* pBits, INT pitch, const RECT& lockedRect);
+	// Water flatten classification WITHOUT the decompose caller gates (2026-06-11):
+	// true when this page's recipe holds a Water placement containing the draw's UV
+	// bbox. Lets the device flatten large water meshes (34-340 verts) that never
+	// reach the crop layer. Classification only -- nothing is cropped or rewritten.
+	bool IsNamekeyWaterDraw(float u_min, float v_min, float u_max, float v_max);
 	void FixTextureFlags(LPDDSURFACEDESC2 lpDDSurfaceDesc2);
 	void PrepareRenderTarget();
 	void ClearDirtyFlags();

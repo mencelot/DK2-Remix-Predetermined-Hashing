@@ -33,6 +33,8 @@
 #include "IClassFactory\IClassFactory.h"
 #include "d3d9\d3d9External.h"
 #include "ddraw\ddrawExternal.h"
+#include "ddraw\HeapReplace.h"
+#include "ddraw\MenuRes.h"
 #include "dinput\dinputExternal.h"
 #include "dinput8\dinput8External.h"
 #include "d3d8\d3d8External.h"
@@ -262,6 +264,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			}
 		}
 		Config.SetConfig();			// Finish setting up config
+
+		// DK2 CRT heap replacement (perf): install as early as possible -- before
+		// DKII.exe's CRT runs its first allocation. No-op unless DdrawReplaceHeap=1;
+		// verify-gated, so a wrong exe build leaves the original heap untouched.
+		HeapReplace::InstallOnce();
+
+		// DK2 front-end menu resolution override (Flame flame:menu-res port): patch
+		// launchGame's hardcoded 640x480 before the menu can run. No-op unless
+		// DdrawMenuResWidth/Height are set; verify-gated on exact site bytes.
+		MenuRes::InstallOnce();
+
 		Logging::LogComputerManufacturer();
 		Logging::LogVideoCard();
 		Logging::LogOSVersion();

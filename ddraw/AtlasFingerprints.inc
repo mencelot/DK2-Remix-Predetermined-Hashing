@@ -88,13 +88,14 @@ static const uint8_t kFP_torch_hud_composite[1024] = {
 	0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x26, 0x6b, 0x69, 0x6a, 0x73, 0x29, 0x02
 };
 static const AtlasRegion kRegions_torch_hud_composite[] = {
-	{ { 0.5000f, 0.7500f, 0.7500f, 1.0000f }, nullptr },  // area=0.0625
-	{ { 0.7500f, 0.7500f, 1.0000f, 1.0000f }, nullptr },  // area=0.0625
-	{ { 0.5000f, 0.0000f, 0.7500f, 0.2500f }, nullptr },  // area=0.0625
-	{ { 0.0000f, 0.0000f, 0.2500f, 0.2500f }, nullptr },  // area=0.0625
-	{ { 0.2500f, 0.0000f, 0.5000f, 0.2500f }, nullptr },  // area=0.0625
-	{ { 0.5000f, 0.0000f, 1.0000f, 0.5000f }, nullptr },  // area=0.2500
-	{ { 0.0000f, 0.0000f, 0.5000f, 0.5000f }, "_scratch_discovery\\extracted\\ktorch0MM0.png" },  // area=0.2500
+	// FLAME REGION ONLY (2026-05-21). The other 6 regions (HUD badge/dial + sandy
+	// corner crops) were removed: the sandy corner [0,0,0.25,0.25] is a SUBSET of
+	// this flame quadrant and, being smaller, won smallest-first matching for ~28
+	// torch draws -> bound the light-tan sand crop -> emissive (x10) saturated it to
+	// WHITE squares (the "mipmap torches"). With only the flame region, those draws
+	// fall into [0,0,0.5,0.5] -> flame canonical. Non-flame draws fall through to the
+	// original atlas bind. We only ever needed the flame stabilized.
+	{ { 0.0000f, 0.0000f, 0.5000f, 0.5000f }, "_scratch_discovery\\extracted\\ktorch0MM0.png" },  // area=0.25 FLAME
 };
 
 // Family: character_portraits

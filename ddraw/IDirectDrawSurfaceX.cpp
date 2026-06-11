@@ -19,6 +19,7 @@
 #include <fstream>
 #include <intrin.h>
 #include <unordered_set>
+#include <list>
 #include <filesystem>
 #include "Utils\Utils.h"
 // xxHash single-header (dxvk-remix's exact copy). XXH_INLINE_ALL pulls in the
@@ -203,6 +204,205 @@ namespace {
 		return ((uint64_t)(uint32_t)familyIdx << 32) | (uint64_t)(uint32_t)regionIdx;
 	}
 
+	// --- Universal UV-region decomposition (2026-05-21) ---
+	// No fingerprints, no hardcoded hashes, no source PNGs. For ANY drawcall whose
+	// stage-0 UV bbox is a proper sub-rect of its bound texture (area gate applied
+	// caller-side), crop that exact texel rect into a sub-texture and bind it.
+	//
+	// One file-scope cache (shared across all surfaces): univDrawCache, keyed by
+	// (atlas wrapper, quantized UV rect) -> sub-texture + the snapped region transform.
+	// PERF-CRITICAL: first sight of a (surface, rect) does the crop; every later frame
+	// is an O(1) hit unless the temporal-validation gate (Phase 2, 2026-05-24) decides
+	// the surface was repurposed -- in which case the entry is invalidated and re-cropped
+	// from current content. The temporal gate replaces the old "freeze forever" policy,
+	// which fixed torch flicker but caused torches to bleed into imp footprints / flies
+	// when DK2 reused source surfaces for different sprites over a session.
+	// (A second cache `univContentCache` was previously declared for cross-surface content
+	// dedup, but the dedup path was removed because the post-stretch sysmem readback
+	// deadlocked against Remix. The declaration is gone now.)
+	struct UnivDrawKey {
+		void* wrapper;
+		uint16_t qu0, qv0, qu1, qv1;   // UV quantized to 1/4096 of the texture
+		bool operator==(const UnivDrawKey& o) const {
+			return wrapper == o.wrapper && qu0 == o.qu0 && qv0 == o.qv0 && qu1 == o.qu1 && qv1 == o.qv1;
+		}
+	};
+	struct UnivDrawKeyHash {
+		size_t operator()(const UnivDrawKey& k) const {
+			size_t h = std::hash<void*>()(k.wrapper);
+			h ^= ((size_t)k.qu0 << 1) ^ ((size_t)k.qv0 << 13) ^ ((size_t)k.qu1 << 27) ^ ((size_t)k.qv1 << 41);
+			return h;
+		}
+	};
+	struct UnivSubTex {
+		IDirect3DTexture9* tex = nullptr;
+		float u0 = 0, v0 = 0, u1 = 1, v1 = 1;   // snapped region in atlas UV space (transform source)
+		std::list<UnivDrawKey>::iterator lruIt; // position in univLru (for O(1) LRU touch/evict)
+		DWORD cachedAtRepurposeGen = 0;         // value of surface.RepurposeGen at cache insert; mismatch at hit time -> invalidate (Phase 5: per-surface idle-then-Blt gate)
+		LONG px0 = 0, py0 = 0, px1 = 0, py1 = 0; // pixel-space rect this sub-texture covers, for per-Blt rect overlap test (Phase 7)
+		DWORD cachedAtTimeMs = 0;               // GetTickCount() at cache insert; per-Blt rect overlap gate compares this to BltHistory entry timestamps (Phase 7)
+	};
+	std::unordered_map<UnivDrawKey, UnivSubTex, UnivDrawKeyHash> univDrawCache;
+	// LRU eviction (2026-05-21): the crop cache USED to be frozen forever -> in a long
+	// session the map's constantly-shifting sub-rects spawned 10k+ MANAGED textures that
+	// were never freed, blowing the 32-bit DKII.exe ~2GB address space -> OOM (confirmed:
+	// canonical without LRU died at 86k crops, ~11min). Now bound: front = LRU, back = MRU.
+	// On a cache hit we splice to back (skipped if already MRU). When over cap we evict +
+	// Release() the front's texture, ONE per insert -- batch eviction (tried earlier)
+	// caused periodic 4k-Release stutters. Torches are drawn every frame -> always MRU.
+	//
+	// Cap retuned to 16384 (2026-05-24 evening) after a 20-min Phase 2 session log showed
+	// 255k crops + 248k evicts on cap=4096 (98% hit ratio but constant LRU churn). Each
+	// evict = a fresh texture appearing/disappearing for Remix to hash, which thrashes
+	// its denoiser caches -> visible as "every texture flickers between usual and black"
+	// in busy scenes. Bigger cap with one-per-insert eviction (NOT batch) should let the
+	// working set fit, evicts -> ~0, Remix sees stable textures. Worst case at 50KB avg
+	// per entry: 16384 * 50KB = ~800MB -- tight for 32-bit but within budget.
+	std::list<UnivDrawKey> univLru;
+	static const size_t kUnivCacheCap = 16384;
+	DWORD univDecomposeBindsTotal = 0;
+	DWORD univCropsTotal = 0;
+	DWORD univEvictTotal = 0;
+	DWORD univInvalidatesTotal = 0;	// times the gen-mismatch gate fired (entry's gen != current surface.RepurposeGen)
+
+	// --- Global rate scarcity gate (Phase 8, 2026-05-24) ---
+	// During particle/effect bursts (e.g. Horny+pool steam: peak 1232 crops/sec across
+	// 141 surfaces, 22442 unique (atlas, rect) keys in 60s, none individually exceeding
+	// the per-surface 30/s blacklist threshold), the per-surface blacklist can't fire
+	// fast enough -- the work fans out across too many surfaces, each just below trip.
+	// Solution: a 1-second sliding window counting crops globally. When rate exceeds
+	// kGlobalRateScarcityEnterPerSec, NEW synthesis returns false (caller falls back to
+	// whole-surface texture). Cache hits are NOT gated -- torches with cached entries
+	// keep their per-region replacements during the storm. Hysteresis (lower exit
+	// threshold) prevents oscillation. Verified normal background is ~50 crops/sec;
+	// burst peak ~1230/s -- threshold 200/s sits comfortably between.
+	static const DWORD kGlobalRateScarcityEnterPerSec = 200;
+	static const DWORD kGlobalRateScarcityExitPerSec = 100;
+	DWORD g_globalRateWindowStartMs = 0;
+	DWORD g_globalRateCropsInWindow = 0;
+	bool  g_globalScarcityMode = false;
+	DWORD univScarcitySkippedTotal = 0;
+	DWORD univScarcityEntersTotal = 0;
+
+	// --- Stage 3 measurement (2026-05-27) ---
+	// Goal: measure mod utilization rather than asserting it. Two aggregates:
+	//   stage3PerSurface[wrapperPtr] -> per-branch counts (hits/crops/invals/scarcity/blacklist)
+	//   stage3BindByHash[xxh3]       -> per-Remix-bind counts (whole vs crop)
+	// Dumped every kStage3DumpIntervalMs from a hot path. Cross-ref hashes vs mod
+	// folders offline to get true substitution coverage. See dk2_mission_measure_before_claiming.
+	struct Stage3SurfaceStat { DWORD hits=0, crops=0, invals=0, scarcitySkips=0, blacklistSkips=0; };
+	std::unordered_map<void*, Stage3SurfaceStat> stage3PerSurface;
+	struct Stage3BindStat { DWORD wholeBinds=0, cropBinds=0; };
+	std::unordered_map<uint64_t, Stage3BindStat> stage3BindByHash;
+	DWORD stage3WholeBindsUnhashed = 0;     // bind whose level-0 couldn't be locked/hashed (rare)
+	DWORD stage3CropBindsUnhashed = 0;
+	// Stage 3 fix (2026-05-29): self-contained content-hash cache keyed by the EXACT
+	// d3d9 texture Remix binds. The original design looked the bound texture up in
+	// capState.firstHashByTex, but that map is (a) only populated when
+	// DdrawContentCapture=1 and (b) keyed by the WRAPPER pointer while bind sites pass
+	// the d3d9 IDirect3DTexture9* -> every lookup missed, all binds counted unhashed.
+	// Hashing the bound texture directly (once per pointer) removes both the capture-flag
+	// dependency and the wrapper-key mismatch.
+	std::unordered_map<IDirect3DTexture9*, uint64_t> stage3HashByD3d9Tex;
+	// Stage 3 corpus dump (2026-05-29): when DdrawContentCapture=1, dump ONE PNG per
+	// distinct WHOLE-surface bound hash, named by the exact Remix key + a manifest row
+	// (hash,width,height,format). This is the runtime-keyed authoring corpus: the OLD
+	// first-bind capture missed the heavily-bound whole surfaces (12/13 head gaps absent
+	// from it). We hash exactly what Remix binds, so <hash>.png IS the correct DDS key.
+	// Crops are skipped (session-specific noise). Dedup is by HASH (the pointer-keyed
+	// cache above can present the same hash via multiple surfaces).
+	std::unordered_set<uint64_t> stage3DumpedHashes;
+	std::ofstream stage3BoundManifest;
+	std::string stage3BoundDir;
+	bool stage3BoundDirReady = false;
+	DWORD stage3LastDumpMs = 0;
+	static const DWORD kStage3DumpIntervalMs = 60000;
+
+	// --- [RECIPE] composition-recipe instrumentation (2026-06-10) ---
+	// Decisive test for write-side canonicalization: DK2 composes atlases via Blt,
+	// which flows through us. If atlas hashes that DRIFT across sessions share an
+	// IDENTICAL recipe -- ordered (srcContentHash, srcRect, dstRect) component list --
+	// then deterministic shadow recomposition can collapse all per-instance/per-session
+	// variants onto one stable hash, removing the per-hash authoring ceiling (216
+	// stable canonicals as of v4). One [RECIPE] line per distinct bound whole-surface
+	// hash; offline cross-session join answers the question with real counts.
+	// Source identity = XXH3 of the source surface's mip-0 (same domain as Remix keys),
+	// cached per wrapper ptr and invalidated via UniquenessValue (bumped on every write).
+	struct RecipeEntry { uint64_t srcHash; uint16_t sx, sy, sw, sh, dx, dy, dw, dh; };
+	struct RecipeState { std::vector<RecipeEntry> entries; DWORD overflows = 0; DWORD directWrites = 0; };
+	std::unordered_map<IDirect3DTexture9*, RecipeState> recipeByTex;
+	std::unordered_map<void*, std::pair<DWORD, uint64_t>> recipeSrcHashCache;	// wrapper ptr -> (UniquenessValue, mip0 hash)
+	std::unordered_set<uint64_t> recipeEmitted;	// content hashes already logged
+	DWORD recipeSurfacesDropped = 0;			// dest surfaces not tracked (map cap hit)
+	IDirect3DTexture9* recipeLastBltTex = nullptr;	// suppresses the directWrites false positive from Blt's own
+												// SetDirtyFlag call, which runs AFTER ScopedFlagSet(IsInBlt) closes
+	// [LOCKW] (2026-06-10, recipe step 3): runs A/B proved ALL whole-surface Blts are
+	// verbatim full-copies from staging surfaces -- composition happens in the game's
+	// Lock writes (or earlier, in game memory). For every surface that has ever served
+	// as a Blt SOURCE, capture each game Lock's rect + game-EXE caller address (via
+	// FindGameCaller stack walk), and flush at SetDirtyFlag with the resulting content
+	// hash. Tells us (a) whether composition is visible at Lock-rect granularity and
+	// (b) the DKII.exe call sites that produce staged content -- the reverse-engineering
+	// entry points for true recipes either way.
+	std::unordered_set<void*> recipeBltSources;		// wrapper ptrs that have fed a recorded Blt
+	struct LockWPend { DWORD eip; RECT rect; bool hasRect; };
+	std::unordered_map<void*, std::vector<LockWPend>> lockWPending;
+	static const size_t kRecipeMaxEntries = 64;		// per-surface component cap (composites observed are ~4-16 Blts)
+	static const size_t kRecipeMaxSurfaces = 8192;	// 32-bit OOM guard: ~8k * ~0.3KB typical = ~2.5MB
+
+	// --- Canonical Identity Layer (2026-06-09) ---
+	// DK2 re-composites pool/atlas surfaces with per-session byte drift (A4R4G4B4
+	// alpha-bit noise + Blt ordering), so the same visual content presents different
+	// Remix hashes across sessions and per-hash mod replacements rot. Instead of
+	// stabilizing the GAME, we stabilize what Remix SEES: at whole-surface bind time,
+	// resolve the bound content to a frozen canonical texture (raw A4R4G4B4 bytes
+	// from _canonical\tex\<HASH>.a4r4, captured 2026-05-29) and bind THAT. The
+	// canonical's Remix hash equals its filename by construction (the file holds the
+	// exact packed mip-0 bytes), so every drifted variant converges onto one stable,
+	// offline-known hash -- mods authored against that hash hit every session.
+	// Resolution order: exact-hash identity (already canonical -> no rebind) ->
+	// warm map (canon_map.csv, harvested from prior sessions' FPMATCH log lines) ->
+	// 32x32-L2 fingerprint match vs canon_fps.bin (same metric as A.10, threshold
+	// kFingerprintL2Threshold). Non-matching content (minimap, live composites) is
+	// bound untouched. SetDirtyFlag invalidates per-texture resolutions on content
+	// writes; a churn cap permanently exempts high-frequency writers (animations)
+	// so they never pay per-write rehashing (mirrors Phase 8 scarcity philosophy).
+	struct CanonFpEntry { uint64_t hash; uint16_t w, h; uint8_t fp[1024]; };
+	std::vector<CanonFpEntry> canonFps;                                  // fingerprint table of canonical contents
+	std::unordered_map<uint64_t, uint64_t> canonMapRuntimeToCanon;       // warm map: runtime hash -> canonical hash
+	std::unordered_set<uint64_t> canonHashSet;                           // all canonical hashes (identity short-circuit)
+	std::unordered_map<uint64_t, IDirect3DTexture9*> canonTexByHash;     // lazy-created canonical textures (nullptr = load failed, don't retry)
+	std::unordered_map<IDirect3DTexture9*, IDirect3DTexture9*> canonResolveByTex; // bind-time resolution cache (nullptr = resolved, no rebind)
+	std::unordered_map<IDirect3DTexture9*, DWORD> canonChurnByTex;       // SetDirtyFlag invalidation count per texture
+	bool canonSidecarsLoaded = false;
+	bool canonDisabled = false;        // sidecars missing/corrupt -> layer inert this session
+	DWORD canonRebindBindsTotal = 0;   // binds redirected to a canonical (per-bind)
+	DWORD canonFpMatchTotal = 0;       // unique contents resolved via fingerprint
+	DWORD canonFpNoMatchTotal = 0;     // unique contents with no canonical (expected: minimap/dynamic)
+	DWORD canonIdentityTotal = 0;      // unique contents already presenting a canonical hash
+	DWORD canonTexCreatedTotal = 0;    // canonical textures synthesized from .a4r4 files
+	DWORD canonChurnExemptTotal = 0;   // textures permanently exempted by the churn cap
+	DWORD canonFpRejectTotal = 0;      // fingerprint matches REJECTED by the pixel verifier (would-be false positives)
+	static const size_t kCanonTexCap = 1500;   // hard cap on synthesized canonicals (32-bit address space discipline)
+	static const DWORD kCanonChurnCap = 32;    // SetDirtyFlag invalidations before permanent exemption
+	// Pixel verifier (added after the 2026-06-09 session audit): the 32x32
+	// fingerprint cannot see quadrant-level content swaps (co-atlased sprite
+	// surfaces, text composites), so a fingerprint match alone may pair contents
+	// that share layout but differ in a region. Before accepting, compare the
+	// runtime bytes to the canonical payload: a pixel is a "big diff" when any
+	// RGB nibble differs by more than kCanonVerifyBigDiffNibbles; reject when
+	// more than 1% of pixels are big-diffs. Mirrors the offline gate that
+	// derives canon_map.csv (canon_assign_map.py), so runtime acceptance and
+	// offline assignment have identical semantics.
+	static const int kCanonVerifyBigDiffNibbles = 2;
+
+	inline uint16_t QuantizeUV(float u)
+	{
+		if (u < 0.0f) u = 0.0f;
+		if (u > 1.0f) u = 1.0f;
+		return (uint16_t)(u * 4096.0f + 0.5f);
+	}
+
 	// Compute 32x32 grayscale fingerprint by scaling source surface to a
 	// 32x32 A8R8G8B8 system-memory target, then luma-converting per pixel.
 	// Returns false on any d3d9 error.
@@ -334,11 +534,17 @@ namespace {
 		capState.captureDir = gameDir + "\\_capture_phase_a7" + ts;
 		std::error_code ec;
 		std::filesystem::create_directories(capState.captureDir, ec);
+		// Origin-tagged buckets (2026-05-21): `world` = original game textures
+		// (PBRify targets; hashes unchanged by the torch fix). `crops` = textures the
+		// universal decompose synthesized (torches + co-atlased sprites) -- leave stock,
+		// PBRify last. Lets the PBRify batch skip torches by BUCKET, no visual hunting.
+		std::filesystem::create_directories(capState.captureDir + "\\world", ec);
+		std::filesystem::create_directories(capState.captureDir + "\\crops", ec);
 		std::string manifestPath = capState.captureDir + "\\manifest.csv";
 		capState.manifest.open(manifestPath, std::ios::out | std::ios::app);
 		if (capState.manifest.is_open())
 		{
-			capState.manifest << "hash,width,height,format,bltSeenTotal\n";
+			capState.manifest << "hash,width,height,format,bltSeenTotal,origin\n";
 			capState.manifest.flush();
 		}
 		Logging::Log() << "[A.7] content capture initialized -> " << capState.captureDir.c_str();
@@ -349,7 +555,7 @@ namespace {
 	// `originatingTex` (optional): the d3d9 texture this surface came from --
 	// when supplied AND we've never seen this texture before, emit a TEX_HASH
 	// log line so offline analysis can join draw-log `tex=` entries to PNG files.
-	void CaptureSurfaceContent(IDirect3DSurface9* destSurface, void* originatingTex = nullptr)
+	void CaptureSurfaceContent(IDirect3DSurface9* destSurface, void* originatingTex = nullptr, bool isCrop = false)
 	{
 		if (!destSurface) return;
 		EnsureContentCaptureInit();
@@ -407,7 +613,8 @@ namespace {
 		if (SUCCEEDED(D3DXSaveSurfaceToFileInMemory(&pBuffer, D3DXIFF_PNG, destSurface, nullptr, nullptr)) && pBuffer)
 		{
 			char pngPath[MAX_PATH];
-			sprintf_s(pngPath, sizeof(pngPath), "%s\\%016llX.png", capState.captureDir.c_str(), (unsigned long long)h);
+			sprintf_s(pngPath, sizeof(pngPath), "%s\\%s\\%016llX.png", capState.captureDir.c_str(),
+				isCrop ? "crops" : "world", (unsigned long long)h);
 			HANDLE fh = CreateFileA(pngPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 			if (fh != INVALID_HANDLE_VALUE)
 			{
@@ -422,9 +629,10 @@ namespace {
 		}
 		if (capState.manifest.is_open())
 		{
-			char buf[128];
-			sprintf_s(buf, sizeof(buf), "%016llX,%u,%u,%u,%u\n",
-				(unsigned long long)h, desc.Width, desc.Height, (UINT)desc.Format, capState.bltSeenTotal);
+			char buf[160];
+			sprintf_s(buf, sizeof(buf), "%016llX,%u,%u,%u,%u,%s\n",
+				(unsigned long long)h, desc.Width, desc.Height, (UINT)desc.Format, capState.bltSeenTotal,
+				isCrop ? "crop" : "world");
 			capState.manifest << buf;
 			if ((capState.savedTotal & 0x0F) == 0) capState.manifest.flush();
 		}
@@ -498,7 +706,1407 @@ namespace {
 		}
 		return 0;
 	}
+
+	// --- [OWNUP] source-identity detour (2026-06-10, recipe step 5) ---------------
+	// Static RE (re_owner_trace.py) established that DK2's texture descriptors carry a
+	// NAME INDEX at +0x24 that resolves, via the name table at [0x78E564] (3-dword
+	// records, record[0] = char* fullname), to an EngineTextures entry name such as
+	// "GUI\C-Spells\c-windMM2". The cache loader 0x58C170 is called __thiscall with
+	// ecx = the descriptor and reads [this+0x24] for exactly this lookup. The OPEN
+	// QUESTION is whether the descriptor present at the dominant upload blit
+	// (DKII.exe 0x58E53B, 78% of staging writes; ESI = the size-class pool slot, [ESI]
+	// = source content surface, [ESI+0x04] = owner back-link) carries a live, resolvable
+	// +0x24 -- i.e. whether STABLE source identity is available right where the atlas is
+	// composed. If yes, replacements can be authored against identity, and DK2's
+	// per-session hash drift (its in-house LRU atlas cache repacking pages) stops
+	// mattering.
+	//
+	// This installs a read-only call-site detour: it rewrites the single rel32 of the
+	// `call 0x58B770` at 0x58E53B to jump through a trampoline that logs the descriptor's
+	// identity fields, then tail-jumps to the real blitter (which `ret 0xC`s straight
+	// back to 0x58E540). The blit is byte-for-byte unchanged; we only observe. Precedent
+	// for patching DKII.exe code: the zoom patch (WriteMemory) and the April pretransform
+	// hook (DdrawEnablePreTransformHook). All game-memory reads are SEH-guarded.
+	uintptr_t ownupBlitTarget = 0;        // rebased 0x58B770 -- value the trampoline jmps to
+	uintptr_t ownupNameTableAddr = 0;     // rebased &[0x78E564] -- holds the name-table base ptr
+	volatile LONG ownupInstallTried = 0;
+	DWORD ownupCalls = 0, ownupBadReads = 0;
+	std::unordered_set<uint32_t> ownupSeen;   // dedup by resolved identity key (bounds log volume)
+
+	struct OwnupSnap {
+		bool ok;
+		void* content; void* owner;
+		uint32_t vtbl, flags, idxA, idxB;
+		int sw, sh, pw, ph;
+		float uv0, uv1, uv2, uv3;
+		char nameA[96]; char nameB[96];
+		bool nameAok, nameBok;
+	};
+
+	// POD-only reads inside SEH (no unwindable C++ objects -> avoids C2712).
+	void OwnupSnapshot(void* slot, OwnupSnap* s)
+	{
+		s->ok = false; s->nameAok = false; s->nameBok = false;
+		s->nameA[0] = 0; s->nameB[0] = 0;
+		__try {
+			BYTE* d = (BYTE*)slot;
+			s->content = *(void**)(d + 0x00);
+			s->owner   = *(void**)(d + 0x04);
+			s->idxA    = *(uint32_t*)(d + 0x24);
+			s->uv0     = *(float*)(d + 0x28);
+			s->uv1     = *(float*)(d + 0x2c);
+			s->uv2     = *(float*)(d + 0x30);
+			s->uv3     = *(float*)(d + 0x34);
+			s->flags   = *(uint32_t*)(d + 0x38);
+			s->sw      = *(BYTE*)(d + 0x3c);
+			s->sh      = *(BYTE*)(d + 0x3d);
+			s->pw      = *(BYTE*)(d + 0x3e);
+			s->ph      = *(BYTE*)(d + 0x3f);
+			s->vtbl    = s->content ? *(uint32_t*)s->content : 0;
+			s->idxB    = s->owner ? *(uint32_t*)((BYTE*)s->owner + 0x24) : 0xFFFFFFFFu;
+			s->ok = true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) { s->ok = false; }
+	}
+
+	// Resolve a candidate name index through the runtime-built name table. Returns true
+	// and fills out[] (NUL-terminated, printable ASCII) only on a clean resolution.
+	bool OwnupResolveName(uint32_t idx, char out[96])
+	{
+		out[0] = 0;
+		if (idx >= 200000u || ownupNameTableAddr == 0) return false;
+		bool ok = false;
+		__try {
+			uintptr_t tableBase = *(uintptr_t*)ownupNameTableAddr;
+			if (tableBase) {
+				const char* name = *(const char**)(tableBase + (uintptr_t)idx * 12u);
+				if (name) {
+					int i = 0;
+					for (; i < 95; i++) {
+						char c = name[i];
+						if (c == 0) break;
+						if ((unsigned char)c < 32 || (unsigned char)c > 126) { i = 0; break; }
+						out[i] = c;
+					}
+					out[i] = 0;
+					ok = (i > 0);
+				}
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; ok = false; }
+		return ok;
+	}
+
+	// __cdecl logger called by the naked trampoline with ESI (the upload descriptor).
+	void __cdecl OwnupLogSlot(void* slot)
+	{
+		ownupCalls++;
+		OwnupSnap s;
+		OwnupSnapshot(slot, &s);
+		if (!s.ok) { ownupBadReads++; return; }
+		s.nameAok = OwnupResolveName(s.idxA, s.nameA);
+		s.nameBok = OwnupResolveName(s.idxB, s.nameB);
+
+		// Dedup key prefers a resolvable name index (slot first, then owner); falls back
+		// to the slot pointer so unresolved variants still log once without flooding.
+		uint32_t key;
+		if (s.nameAok)      key = s.idxA;
+		else if (s.nameBok) key = s.idxB ^ 0x40000000u;
+		else                key = 0x80000000u | ((uint32_t)(uintptr_t)slot & 0x3FFFFFFFu);
+
+		if (!ownupSeen.insert(key).second) return;   // identity already logged
+		if (ownupSeen.size() > 6000) return;          // 32-bit flood/OOM guard
+
+		char buf[460];
+		sprintf_s(buf, sizeof(buf),
+			"[OWNUP] slot=%p content=%p vtbl=%08X flags=%08X srcwh=%dx%d padwh=%dx%d "
+			"idxA=%u nameA=%s%s%s owner=%p idxB=%u nameB=%s%s%s uv=%.4f,%.4f,%.4f,%.4f",
+			slot, s.content, s.vtbl, s.flags, s.sw, s.sh, s.pw, s.ph,
+			s.idxA, s.nameAok ? "\"" : "", s.nameAok ? s.nameA : "(none)", s.nameAok ? "\"" : "",
+			s.owner, s.idxB, s.nameBok ? "\"" : "", s.nameBok ? s.nameB : "(none)", s.nameBok ? "\"" : "",
+			s.uv0, s.uv1, s.uv2, s.uv3);
+		Logging::Log() << buf;
+	}
+
+	// POD-only SEH helper, kept separate from OwnupInstallHookOnce: that function builds
+	// Logging stream temporaries (objects requiring unwinding), which cannot coexist with
+	// __try in one function (C2712). Verifies the call-site still holds `E8 ->0x58B770`.
+	bool OwnupVerifyCallSite(const BYTE* p, uintptr_t callSite, int32_t* outRel)
+	{
+		bool sane = false;
+		__try {
+			if (p[0] == 0xE8) {
+				int32_t rel = *(const int32_t*)(p + 1);
+				*outRel = rel;
+				sane = (callSite + 5 + (intptr_t)rel == ownupBlitTarget);
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) { sane = false; }
+		return sane;
+	}
+
+	// --- [NAMEKEY] B-v1: name-keyed canonicalization (2026-06-11) -------------------
+	// The OWNUP run proved the descriptor at the 0x58E53B upload blit carries stable
+	// EngineTextures identity (614/614 names resolved, 0 bad reads). This block turns
+	// that fact into a resolver. The SAME read-only call-site detour now RECORDS each
+	// placement {nameIdx, mip, destX, destY, w, h} into an accumulator; the
+	// full-surface staging->texture Blt (the [RECIPE]-proven upload shape, runs A/B:
+	// ~99% of dest content arrives exactly that way) attaches the accumulated
+	// placements to the dest texture as its TRUE composition recipe; at bind, a
+	// single-name FULL-page recipe resolves through _canonical\name_map.csv
+	// (key = fullname + "MM{mip}", what cache loader 0x58C170 sprintf's) to a
+	// canonical by EXACT identity -- replacing the fragile 32x32-L2 fingerprint
+	// retrieval for everything the detour saw. Game memory is never written (beyond
+	// the one rel32 call-site redirect the OWNUP run proved safe); the "write" is the
+	// existing d3d9 rebind. Composites (ncomp>1 / sub-page sprites) stay on the
+	// fingerprint path until shadow recomposition (v2).
+	// DdrawNameKey: 1 = shadow mode (record+resolve+verify but the legacy path stays
+	// authoritative; logs agreement stats), 2 = name key authoritative (pixel-verified,
+	// legacy fingerprint as fallback). Requires DdrawCanonicalRebind=1 to take effect.
+	struct NamekeyPlacement { uint32_t idx; uint32_t mip; int32_t a2, a3; int32_t sw, sh; float u0, v0, u1, v1; bool isWater = false; };
+	std::vector<NamekeyPlacement> namekeyAccum;       // placements since the current composition started
+	bool namekeyConsumedSinceLast = false;            // a consume happened; next placement starts a new composition
+	// V2 (2026-06-11): comps retains the FULL placement list (the accumulator copy) so the
+	// crop layer can match draw rects to sprites; the scalar fields stay the comp0 summary
+	// the v1 whole-page resolver reads. u0..v1 = the descriptor's four UV floats (+0x28..0x34,
+	// 0x58E3E0 computes them with the half-texel 0.5 constant) -- telemetry for now.
+	struct NamekeyRecipe { uint32_t idx; uint32_t mip; uint32_t ncomp; bool fullPage; bool dynUiSolo; bool hasWater = false; int32_t x0, y0, sw0, sh0; std::vector<NamekeyPlacement> comps; };
+	std::unordered_map<IDirect3DTexture9*, NamekeyRecipe> namekeyRecipeByTex;  // dest tex -> last attached recipe (no erase on release; same precedent as stage3 maps)
+	std::unordered_map<uint32_t, std::string> namekeyNameByIdx;                // resolved-name cache (~hundreds of entries)
+	std::unordered_map<std::string, uint64_t> namekeyNameToCanon;              // name_map.csv, keys lowercased
+	const size_t kNamekeyMaxAccum = 64;
+	const size_t kNamekeyMaxRecipes = 8192;
+	DWORD namekeyPlacements = 0, namekeyAccumOverflow = 0, namekeyConsumes = 0, namekeyOrphanConsumes = 0,
+		namekeyMultiComp = 0, namekeyResolves = 0, namekeyVerifyFails = 0, namekeyNoRecipe = 0,
+		namekeyNotSingleMulti = 0, namekeyNotSingleSub = 0, namekeyUnmapped = 0, namekeyShadowAgree = 0,
+		namekeyShadowDisagree = 0, namekeyShadowOnly = 0, namekeyRawLogged = 0, namekeyConsumeLogged = 0;
+	// Run-2 telemetry (2026-06-11): dedup'd one-line inventories of the three
+	// populations the shadow run exposed. UNMAPPED = the v1.5 authoring list;
+	// SUBPAGE (single sprite, stale rest-of-page -- why fpReject ran 2943/run and
+	// those hashes can never be stable) + MULTI (composite name-sets, recurring or
+	// not) = the v2 scoping data.
+	std::unordered_set<uint64_t> namekeyMultiSeen;
+	std::unordered_set<uint32_t> namekeySubSeen;
+	std::unordered_set<std::string> namekeyUnmappedSeen;
+	DWORD namekeyMultiLogged = 0, namekeySubLogged = 0, namekeyUnmappedLogged = 0;
+
+	// --- [NAMEKEY] V2: placement-keyed crop resolution (2026-06-11) -------------------
+	// The crop counterpart of the v1 whole-page resolver. crop_payloads.bin holds the
+	// expected A4R4G4B4 payload for EVERY EngineTextures entry (5767, built offline by
+	// crop_payloads_build.py from extracted\ decodes, truncate quantization). At draw
+	// time, a snapped UV rect contained in exactly one recipe placement resolves to
+	// (nameIdx, mip); the live page rect is verified against the payload with the SAME
+	// nibble gate as CanonVerifyAgainstPayload, and the bound sub-texture is built FROM
+	// the payload -- mip-0 verbatim, so its Remix hash == XXH3(payload), known offline
+	// for the whole corpus (_scratch_discovery\crop_hashes.csv = the authoring table).
+	// Verification runs on EVERY univDrawCache insert, not just first synthesis: both
+	// global-cache poisoning AND stale-recipe misbinds fail closed to the legacy crop.
+	struct NamekeyCropIdxEnt { uint32_t off; uint16_t w, h; };
+	std::unordered_map<uint64_t, NamekeyCropIdxEnt> namekeyCropIdx;	// XXH3(lowercased "nameMMn") -> payload location
+	// Per-(nameIdx<<3|mip) resolution state. st: 1 = VERIFIED (tex + payload resident,
+	// ~7KB avg, working set a few MB), -1 = permanent fail (no sidecar/dims/create),
+	// 2 = shadow-logged (mode 1; payload dropped). Verify failures at serve time do NOT
+	// poison the state -- they are per-draw (stale recipe) and retried naturally.
+	struct NamekeyCropState { int st = 0; bool dynUi = false; bool isPointer = false; bool isWater = false; IDirect3DTexture9* tex = nullptr; uint16_t w = 0, h = 0; std::vector<uint8_t> payload; };
+	std::unordered_map<uint64_t, NamekeyCropState> namekeyCropByKey;
+	// payload hash -> texture, the OWNER reference (never released; session lifetime,
+	// same precedent as canonTexByHash). Byte-identical twins (chicken/Unique_chicken)
+	// share one texture. univDrawCache entries AddRef on insert / Release on evict.
+	std::unordered_map<uint64_t, IDirect3DTexture9*> namekeyCropTexByHash;
+	static const size_t kNamekeyCropTexCap = 2048;	// 32-bit discipline: <=2048 * ~45KB chain = ~90MB worst, working set ~25MB
+	DWORD namekeyCropMatch = 0, namekeyCropAmbiguous = 0, namekeyCropSubmiss = 0,
+		namekeyCropNoSidecar = 0, namekeyCropDimsMismatch = 0, namekeyCropBadFormat = 0,
+		namekeyCropReadFail = 0, namekeyCropVerifyFail = 0, namekeyCropServeVerifyFail = 0,
+		namekeyCropSynth = 0, namekeyCropServe = 0, namekeyCropShadowPass = 0,
+		namekeyCropShadowFail = 0, namekeyCropTexCreated = 0, namekeyCropMm0Collapse = 0;
+	DWORD namekeyCropLogged = 0, namekeyCropShadowLogged = 0;
+	DWORD namekeyDynUiDraws = 0, namekeyWaterCollapse = 0;
+
+	// --- Dynamic-UI emissive classification (2026-06-11) ------------------------------
+	// The mouse pointer (PointerInfo Page* strips), tooltips (ToolTip Page*), path
+	// subtitles, and the minimap (map_texture) are RENDERED AT RUNTIME -- no
+	// EngineTextures source, no stable hash, so no mod entry can ever make them
+	// visible. But they ARE name-identified by the placement system, and visibility
+	// under a path tracer is a render-state question: forcing those draws to
+	// additive blending makes Remix treat them as emissive (the torch-flame
+	// mechanism), self-lit in the dark. Classification happens here (name level);
+	// IDirect3DDeviceX.cpp wraps the actual draw via the extern accessors below.
+	bool g_namekeyDrawDynUi = false;	// additive-eligible dynamic UI (tooltips/map/subtitles), set during TryGetUniversalSubTextureForUV
+	bool g_namekeyDrawDynUiAny = false;	// ANY dynamic UI incl. pointer strips (drives DYNUI CROP hash logging)
+	bool g_namekeyDrawWater = false;	// water-surface draw (WaterN/WaterSOLIDN placement) -> device flattens its world heights
+	DWORD namekeyWaterFlatten = 0;		// draws flattened (counted device-side via NamekeyNoteWaterFlatten)
+	DWORD namekeyWaterLarge = 0;		// draws classified water by the gate-free recipe check (large bodies the crop layer never sees)
+	std::unordered_set<uint64_t> namekeyDynUiCropLogged;
+	DWORD namekeyDynUiCropLogLines = 0;
+
+	bool NamekeyNameIsDynamicUi(const char* lowerName)
+	{
+		return !strncmp(lowerName, "pointerinfo", 11) || !strncmp(lowerName, "tooltip", 7) ||
+			!strncmp(lowerName, "map_texture", 11) || !strncmp(lowerName, "followpathsubt", 14);
+	}
+
+	// WaterN / WaterSOLIDN sprite names (digit required: bare "Water"/"WaterSOLID"
+	// would also match non-frame entries). Works on the bare lowercased name AND on
+	// the "nameMMn" crop key -- the char after the prefix is a digit in both.
+	bool NamekeyNameIsWater(const char* lowerName)
+	{
+		return (!strncmp(lowerName, "watersolid", 10) && isdigit((unsigned char)lowerName[10])) ||
+			(!strncmp(lowerName, "water", 5) && isdigit((unsigned char)lowerName[5]));
+	}
+
+	// The mouse pointer is split out of the ADDITIVE treatment (2026-06-11, after the
+	// first dynUi run): additive can only ADD light, so the mostly-dark hand sprite
+	// stayed invisible while tooltips/map lit up. The pointer's correct treatment is
+	// rtx.uiTextures rasterization (original colors on top) -- the Desktop copy
+	// proved it persistently; we tag the CURRENT bound hashes via the DYNUI CROP log.
+	bool NamekeyNameIsPointer(const char* lowerName)
+	{
+		return !strncmp(lowerName, "pointerinfo", 11);
+	}
+
+	// Resolve-and-cache a descriptor name index (SEH-guarded game-memory read inside).
+	const char* NamekeyNameForIdx(uint32_t idx)
+	{
+		auto nIt = namekeyNameByIdx.find(idx);
+		if (nIt == namekeyNameByIdx.end())
+		{
+			char nm[96];
+			if (!OwnupResolveName(idx, nm)) return nullptr;
+			nIt = namekeyNameByIdx.emplace(idx, nm).first;
+		}
+		return nIt->second.c_str();
+	}
+
+	// __cdecl recorder called by the naked trampoline: ESI (the descriptor) plus the
+	// real blitter's three stack args (static RE step 4: srcSurface/destX/destY; the
+	// exact push order is confirmed empirically via the RAW lines below -- whichever
+	// arg equals [slot+0x00] is the source surface). destX/destY only matter for v2
+	// composites; v1's single-name-full-page test needs only sw/sh, so a swapped
+	// provisional order is harmless.
+	void __cdecl NamekeyRecordUpload(void* slot, DWORD a1, DWORD a2, DWORD a3)
+	{
+		if (Config.DdrawOwnerLog) OwnupLogSlot(slot);   // [OWNUP] diagnostics still available under the unified hook
+		if (!Config.DdrawNameKey) return;
+
+		OwnupSnap s;
+		OwnupSnapshot(slot, &s);
+		if (!s.ok) return;
+
+		namekeyPlacements++;
+		if (namekeyConsumedSinceLast) { namekeyAccum.clear(); namekeyConsumedSinceLast = false; }
+		if (namekeyAccum.size() >= kNamekeyMaxAccum) { namekeyAccumOverflow++; return; }
+		NamekeyPlacement p;
+		p.idx = s.idxA; p.mip = (s.flags & 7);
+		p.a2 = (int32_t)a2; p.a3 = (int32_t)a3; p.sw = s.sw; p.sh = s.sh;
+		p.u0 = s.uv0; p.v0 = s.uv1; p.u1 = s.uv2; p.v1 = s.uv3;
+		namekeyAccum.push_back(p);
+
+		if (namekeyRawLogged < 8)	// arg-order self-check: a1 should equal the content ptr
+		{
+			namekeyRawLogged++;
+			char buf[260];
+			sprintf_s(buf, sizeof(buf), "[NAMEKEY] RAW slot=%p content=%p a1=%08lX a2=%ld a3=%ld idx=%u mip=%u sw=%d sh=%d uv=%.4f,%.4f,%.4f,%.4f",
+				slot, s.content, (unsigned long)a1, (long)a2, (long)a3, s.idxA, (unsigned)(s.flags & 7), s.sw, s.sh,
+				s.uv0, s.uv1, s.uv2, s.uv3);
+			Logging::Log() << buf;
+		}
+	}
+
+	// Naked call-site trampoline: save full state, record (and optionally [OWNUP]-log),
+	// restore, tail-jump to the real blitter. The original `call` already pushed the
+	// return address 0x58E540 and the three blit args below it -- 0x58B770 `ret 0xC`s
+	// straight back, so a plain jmp (not call) preserves the stack exactly. Offsets:
+	// pushad+pushfd = 36 bytes, so at the first mov the args sit at [esp+40/44/48];
+	// each push shifts the next target back to +48.
+	__declspec(naked) void NamekeyTrampoline()
+	{
+		__asm {
+			pushad
+			pushfd
+			mov  eax, dword ptr [esp + 48]	; blit arg3
+			push eax
+			mov  eax, dword ptr [esp + 48]	; blit arg2
+			push eax
+			mov  eax, dword ptr [esp + 48]	; blit arg1
+			push eax
+			push esi
+			call NamekeyRecordUpload
+			add  esp, 16
+			popfd
+			popad
+			jmp  dword ptr [ownupBlitTarget]
+		}
+	}
+
+	// [NAMEKEY] consume: a full-surface verbatim copy of the composed staging page
+	// into a texture. Attach the accumulated placements to the dest. The accumulator
+	// is COPIED, not cleared: the game composes once then blts the same staging
+	// content to N per-instance textures (Phase A.6 pattern); the next placement
+	// arriving after a consume is what starts a fresh composition.
+	void NamekeyConsumeAt(IDirect3DTexture9* destTex, DWORD W, DWORD H)
+	{
+		namekeyConsumes++;
+		if (namekeyAccum.empty())
+		{
+			namekeyOrphanConsumes++;
+			namekeyRecipeByTex.erase(destTex);	// an untracked recompose must not leave a stale recipe
+			return;
+		}
+		if (namekeyRecipeByTex.size() >= kNamekeyMaxRecipes && !namekeyRecipeByTex.count(destTex))
+		{
+			namekeyConsumedSinceLast = true;
+			return;
+		}
+		NamekeyRecipe r;
+		r.comps = namekeyAccum;	// V2: full placement list (the crop layer's match set)
+		r.ncomp = (uint32_t)namekeyAccum.size();
+		r.idx = namekeyAccum[0].idx;
+		r.mip = namekeyAccum[0].mip;
+		// Dynamic-UI solo page (map_texture etc.): classify once at consume so even
+		// FULL-page draws (which never reach the crop layer) can be identified.
+		r.dynUiSolo = false;
+		if (r.ncomp == 1)
+		{
+			const char* nm0 = NamekeyNameForIdx(r.idx);
+			if (nm0)
+			{
+				char ln[96];
+				strcpy_s(ln, sizeof(ln), nm0);
+				for (char* c = ln; *c; ++c) *c = (char)tolower((unsigned char)*c);
+				r.dynUiSolo = NamekeyNameIsDynamicUi(ln);
+			}
+		}
+		// Water placements flagged once per consume so the device's gate-free flatten
+		// classification (IsNamekeyWaterDraw) costs only a containment scan per draw.
+		// Run-11 measurement: large water bodies are 34-340 vert meshes whose UV bbox
+		// sits exactly inside ONE Water placement -- they never pass the decompose
+		// caller gates, so consume-time is the only place that sees them coming.
+		r.hasWater = false;
+		for (NamekeyPlacement& q : r.comps)
+		{
+			q.isWater = false;
+			const char* nmw = NamekeyNameForIdx(q.idx);	// cached by idx after first resolve
+			if (nmw)
+			{
+				char lnw[96];
+				strcpy_s(lnw, sizeof(lnw), nmw);
+				for (char* c = lnw; *c; ++c) *c = (char)tolower((unsigned char)*c);
+				q.isWater = NamekeyNameIsWater(lnw);
+				r.hasWater |= q.isWater;
+			}
+		}
+		r.x0 = namekeyAccum[0].a2;	// arg order confirmed run 1: a2=destX, a3=destY (a1==content ptr 8/8)
+		r.y0 = namekeyAccum[0].a3;
+		r.sw0 = namekeyAccum[0].sw;
+		r.sh0 = namekeyAccum[0].sh;
+		r.fullPage = (r.ncomp == 1 && namekeyAccum[0].sw == (int32_t)W && namekeyAccum[0].sh == (int32_t)H);
+		if (r.ncomp > 1)
+		{
+			namekeyMultiComp++;
+			// [NAMEKEY] MULTI: dedup-log distinct compositions (signature over the
+			// full placement list). Answers the v2 question: are composite pages
+			// recurring (name,pos) sets, or free-form repacks?
+			uint64_t sig = 1469598103934665603ull;
+			for (const NamekeyPlacement& q : namekeyAccum)
+			{
+				const uint32_t parts[4] = { q.idx, (q.mip << 16) ^ (uint32_t)(q.sw << 8) ^ (uint32_t)q.sh,
+					(uint32_t)q.a2, (uint32_t)q.a3 };
+				for (int i = 0; i < 4; i++) { sig ^= parts[i]; sig *= 1099511628211ull; }
+			}
+			if (namekeyMultiLogged < 80 && namekeyMultiSeen.insert(sig).second)
+			{
+				namekeyMultiLogged++;
+				char part[160];
+				sprintf_s(part, sizeof(part), "[NAMEKEY] MULTI dst=%lux%lu n=%u comps=", (unsigned long)W, (unsigned long)H, r.ncomp);
+				std::string line = part;
+				for (const NamekeyPlacement& q : namekeyAccum)
+				{
+					const char* nm = NamekeyNameForIdx(q.idx);
+					sprintf_s(part, sizeof(part), "%s:MM%u@%ld,%ld:%dx%d|",
+						nm ? nm : "?", q.mip, (long)q.a2, (long)q.a3, q.sw, q.sh);
+					line += part;
+				}
+				Logging::Log() << line.c_str();
+			}
+		}
+		namekeyRecipeByTex[destTex] = r;
+		namekeyConsumedSinceLast = true;
+
+		if (namekeyConsumeLogged < 40)
+		{
+			namekeyConsumeLogged++;
+			char buf[180];
+			sprintf_s(buf, sizeof(buf), "[NAMEKEY] CONSUME tex=%p dst=%lux%lu ncomp=%u idx0=%u mip=%u sw=%d sh=%d full=%d",
+				(void*)destTex, (unsigned long)W, (unsigned long)H, r.ncomp, r.idx, r.mip,
+				namekeyAccum[0].sw, namekeyAccum[0].sh, r.fullPage ? 1 : 0);
+			Logging::Log() << buf;
+		}
+	}
+
+	// [NAMEKEY] resolve helper: the bound texture's attached recipe -> canonical hash,
+	// or 0 with a counter bump explaining why not. Single-name FULL-page recipes only
+	// in v1. nameOut receives the computed "fullnameMM{mip}" key for logging.
+	uint64_t NamekeyLookupCanon(IDirect3DTexture9* tex, char* nameOut, size_t nameOutLen)
+	{
+		if (nameOut && nameOutLen) nameOut[0] = 0;
+		auto it = namekeyRecipeByTex.find(tex);
+		if (it == namekeyRecipeByTex.end()) { namekeyNoRecipe++; return 0; }
+		const NamekeyRecipe& r = it->second;
+		if (r.ncomp != 1) { namekeyNotSingleMulti++; return 0; }
+		if (!r.fullPage)
+		{
+			// Single sprite NOT covering the page: the rest of the page is stale LRU
+			// residue, so the page hash can never be stable -- the class behind run 1's
+			// fpReject=2943. Inventory it for v2 (rebind needs a recomposed canonical
+			// at the recorded position, or UV-aware substitution).
+			namekeyNotSingleSub++;
+			if (namekeySubLogged < 80 && namekeySubSeen.insert(r.idx ^ (r.mip << 28)).second)
+			{
+				namekeySubLogged++;
+				const char* nm = NamekeyNameForIdx(r.idx);
+				char buf[220];
+				sprintf_s(buf, sizeof(buf), "[NAMEKEY] SUBPAGE name=\"%s\" mip=%u at=%ld,%ld size=%dx%d",
+					nm ? nm : "?", r.mip, (long)r.x0, (long)r.y0, r.sw0, r.sh0);
+				Logging::Log() << buf;
+			}
+			return 0;
+		}
+
+		const char* nm = NamekeyNameForIdx(r.idx);
+		if (!nm) return 0;
+		char key[128];
+		sprintf_s(key, sizeof(key), "%sMM%u", nm, r.mip);
+		if (nameOut && nameOutLen) strcpy_s(nameOut, nameOutLen, key);
+		std::string k(key);
+		for (auto& c : k) c = (char)tolower((unsigned char)c);
+		auto mIt = namekeyNameToCanon.find(k);
+		if (mIt == namekeyNameToCanon.end())
+		{
+			namekeyUnmapped++;
+			// The v1.5 authoring list: single-name full-page contents with no
+			// canonical yet. Generate from extracted\ sources, add map row + mod entry.
+			if (namekeyUnmappedLogged < 400 && namekeyUnmappedSeen.insert(k).second)
+			{
+				namekeyUnmappedLogged++;
+				char buf[220];
+				sprintf_s(buf, sizeof(buf), "[NAMEKEY] UNMAPPED key=\"%s\" dims=%dx%d", key, r.sw0, r.sh0);
+				Logging::Log() << buf;
+			}
+			return 0;
+		}
+		return mIt->second;
+	}
+
+	void OwnupInstallHookOnce()
+	{
+		if (!Config.DdrawOwnerLog && !Config.DdrawNameKey) return;
+		if (InterlockedExchange(&ownupInstallTried, 1) != 0) return;
+
+		uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+		if (!base) { Logging::Log() << "[OWNUP] install: no module base"; return; }
+		const uintptr_t kImgBase = 0x400000;
+		uintptr_t callSite   = base + (0x58E53B - kImgBase);
+		ownupBlitTarget      = base + (0x58B770 - kImgBase);
+		ownupNameTableAddr   = base + (0x78E564 - kImgBase);
+
+		BYTE* p = (BYTE*)callSite;
+		DWORD oldProt = 0;
+		if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldProt))
+		{ Logging::Log() << "[OWNUP] install: VirtualProtect failed err=" << GetLastError(); return; }
+
+		int32_t curRel = 0;
+		bool sane = OwnupVerifyCallSite(p, callSite, &curRel);
+
+		if (sane) {
+			int32_t newRel = (int32_t)((intptr_t)((BYTE*)&NamekeyTrampoline) - (intptr_t)(callSite + 5));
+			*(int32_t*)(p + 1) = newRel;   // E8 opcode preserved; only the rel32 changes
+			FlushInstructionCache(GetCurrentProcess(), p, 5);
+			char b[220];
+			sprintf_s(b, sizeof(b), "[NAMEKEY] HOOK INSTALLED base=%p site=%p trampoline=%p blit=%p nametbl=%p ownerlog=%d namekey=%lu",
+				(void*)base, (void*)callSite, (void*)&NamekeyTrampoline, (void*)ownupBlitTarget, (void*)ownupNameTableAddr,
+				Config.DdrawOwnerLog ? 1 : 0, (unsigned long)Config.DdrawNameKey);
+			Logging::Log() << b;
+		} else {
+			char b[160];
+			sprintf_s(b, sizeof(b), "[OWNUP] install ABORTED: unexpected bytes at %p b0=%02X rel=%08X",
+				(void*)callSite, (unsigned)p[0], (unsigned)curRel);
+			Logging::Log() << b;
+		}
+		VirtualProtect(p, 5, oldProt, &oldProt);
+	}
+
+	// Stage 3 fix (2026-05-29): compute a bound d3d9 texture's content hash the same
+	// way CaptureSurfaceContent does -- XXH3_64 over tightly-packed mip-0 rows, skipping
+	// allocator pitch padding -- so it equals Remix's substitution key (verified byte-exact
+	// for static textures, see dk2_xxh3_remix_hash). Returns 0 on any failure (no surface,
+	// unknown bpp, lock failure). Capture-independent: does NOT require DdrawContentCapture.
+	uint64_t Stage3HashD3d9Texture(IDirect3DTexture9* tex)
+	{
+		if (!tex) return 0;
+		IDirect3DSurface9* lvl0 = nullptr;
+		if (FAILED(tex->GetSurfaceLevel(0, &lvl0)) || !lvl0) return 0;
+		uint64_t h = 0;
+		D3DSURFACE_DESC desc = {};
+		if (SUCCEEDED(lvl0->GetDesc(&desc)))
+		{
+			const DWORD bpp = GetBitCount(desc.Format) / 8;
+			D3DLOCKED_RECT lr = {};
+			if (bpp != 0 && SUCCEEDED(lvl0->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
+			{
+				const UINT rowBytes = desc.Width * bpp;
+				XXH3_state_t* xstate = XXH3_createState();
+				if (xstate)
+				{
+					XXH3_64bits_reset(xstate);
+					const uint8_t* base = static_cast<const uint8_t*>(lr.pBits);
+					for (UINT y = 0; y < desc.Height; ++y)
+					{
+						const uint8_t* row = base + static_cast<size_t>(y) * lr.Pitch;
+						UINT bytesThisRow = rowBytes;
+						if (bytesThisRow > static_cast<UINT>(lr.Pitch)) bytesThisRow = static_cast<UINT>(lr.Pitch);
+						XXH3_64bits_update(xstate, row, bytesThisRow);
+					}
+					h = static_cast<uint64_t>(XXH3_64bits_digest(xstate));
+					XXH3_freeState(xstate);
+				}
+				lvl0->UnlockRect();
+			}
+		}
+		lvl0->Release();
+		return h;
+	}
+
+	// [RECIPE] append one Blt to the destination texture's composition recipe.
+	// New-composition detection: a full-surface overwrite OR a re-write of a dst rect
+	// already present in the recipe starts a new generation (clear, then append) --
+	// per-frame recomposition of the same layout thus yields one frame's recipe, not
+	// an unbounded mix of generations.
+	void RecipeRecordBlt(IDirect3DTexture9* destTex, uint64_t srcHash, const RECT& s, const RECT& d, DWORD W, DWORD H)
+	{
+		if (!destTex) return;
+		auto it = recipeByTex.find(destTex);
+		if (it == recipeByTex.end())
+		{
+			if (recipeByTex.size() >= kRecipeMaxSurfaces) { recipeSurfacesDropped++; return; }
+			it = recipeByTex.emplace(destTex, RecipeState{}).first;
+		}
+		RecipeState& st = it->second;
+		const uint16_t dx = (uint16_t)d.left, dy = (uint16_t)d.top;
+		const uint16_t dw = (uint16_t)(d.right - d.left), dh = (uint16_t)(d.bottom - d.top);
+		bool resetFirst = (d.left <= 0 && d.top <= 0 && d.right >= (LONG)W && d.bottom >= (LONG)H && !st.entries.empty());
+		if (!resetFirst)
+		{
+			for (const RecipeEntry& e : st.entries)
+			{
+				if (e.dx == dx && e.dy == dy && e.dw == dw && e.dh == dh) { resetFirst = true; break; }
+			}
+		}
+		if (resetFirst) { st.entries.clear(); st.overflows = 0; st.directWrites = 0; }
+		if (st.entries.size() >= kRecipeMaxEntries) { st.overflows++; return; }
+		RecipeEntry e;
+		e.srcHash = srcHash;
+		e.sx = (uint16_t)s.left; e.sy = (uint16_t)s.top;
+		e.sw = (uint16_t)(s.right - s.left); e.sh = (uint16_t)(s.bottom - s.top);
+		e.dx = dx; e.dy = dy; e.dw = dw; e.dh = dh;
+		st.entries.push_back(e);
+	}
+
+	// [RECIPE] emit one log line per distinct bound whole-surface content hash:
+	// the recipe that produced it (or norecipe=1 for Lock-written / untracked content).
+	// rhash = XXH3 over the packed entry array (order-sensitive); comps list lets the
+	// offline join also compare order-insensitively.
+	void RecipeEmitForHash(IDirect3DTexture9* tex, uint64_t h)
+	{
+		if (!recipeEmitted.insert(h).second) return;
+		auto it = recipeByTex.find(tex);
+		char head[160];
+		if (it == recipeByTex.end() || it->second.entries.empty())
+		{
+			sprintf_s(head, sizeof(head), "[RECIPE] hash=%016llX ncomp=0 norecipe=1", (unsigned long long)h);
+			Logging::Log() << head;
+			return;
+		}
+		const RecipeState& st = it->second;
+		const uint64_t rhash = (uint64_t)XXH3_64bits(st.entries.data(), st.entries.size() * sizeof(RecipeEntry));
+		sprintf_s(head, sizeof(head), "[RECIPE] hash=%016llX rhash=%016llX ncomp=%u ov=%u direct=%u comps=",
+			(unsigned long long)h, (unsigned long long)rhash, (unsigned)st.entries.size(), st.overflows, st.directWrites);
+		std::string line = head;
+		char comp[96];
+		for (const RecipeEntry& e : st.entries)
+		{
+			sprintf_s(comp, sizeof(comp), "%016llX:%u,%u,%u,%u->%u,%u,%u,%u|",
+				(unsigned long long)e.srcHash, e.sx, e.sy, e.sw, e.sh, e.dx, e.dy, e.dw, e.dh);
+			line += comp;
+		}
+		Logging::Log() << line.c_str();
+	}
+
+	// Stage 3 corpus dump (2026-05-29): save the bound whole-surface texture as a PNG
+	// keyed by its exact Remix hash + a manifest row. Once per distinct hash. Gated by
+	// DdrawContentCapture so normal play has zero overhead. Lets offline tooling visually
+	// fingerprint-match each runtime hash to an extracted source PNG, then author an
+	// upscaled <hash>_*.dds that Remix will substitute (the hash IS the key).
+	void Stage3MaybeDumpBound(IDirect3DTexture9* tex, uint64_t hash, bool isCrop)
+	{
+		// Flag split 2026-06-09: DdrawStage3BoundDump enables JUST this cheap dump
+		// (one PNG per distinct whole hash) without the full A.7 capture's
+		// ~60k-files/session overhead. Either flag turns it on.
+		if ((!Config.DdrawContentCapture && !Config.DdrawStage3BoundDump) || isCrop || !tex || hash == 0) return;
+		if (!stage3DumpedHashes.insert(hash).second) return; // one PNG per distinct hash
+		if (!stage3BoundDirReady)
+		{
+			EnsureContentCaptureInit();
+			std::error_code ec;
+			stage3BoundDir = capState.captureDir + "\\stage3_bound";
+			std::filesystem::create_directories(stage3BoundDir, ec);
+			stage3BoundManifest.open(stage3BoundDir + "\\manifest.csv", std::ios::out | std::ios::app);
+			if (stage3BoundManifest.is_open()) { stage3BoundManifest << "hash,width,height,format\n"; stage3BoundManifest.flush(); }
+			stage3BoundDirReady = true;
+		}
+		IDirect3DSurface9* lvl0 = nullptr;
+		if (FAILED(tex->GetSurfaceLevel(0, &lvl0)) || !lvl0) return;
+		D3DSURFACE_DESC desc = {};
+		lvl0->GetDesc(&desc);
+		LPD3DXBUFFER pBuffer = nullptr;
+		if (SUCCEEDED(D3DXSaveSurfaceToFileInMemory(&pBuffer, D3DXIFF_PNG, lvl0, nullptr, nullptr)) && pBuffer)
+		{
+			char pngPath[MAX_PATH];
+			sprintf_s(pngPath, sizeof(pngPath), "%s\\%016llX.png", stage3BoundDir.c_str(), (unsigned long long)hash);
+			HANDLE fh = CreateFileA(pngPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (fh != INVALID_HANDLE_VALUE)
+			{
+				DWORD written = 0;
+				WriteFile(fh, pBuffer->GetBufferPointer(), (DWORD)pBuffer->GetBufferSize(), &written, nullptr);
+				CloseHandle(fh);
+			}
+			pBuffer->Release();
+		}
+		if (stage3BoundManifest.is_open())
+		{
+			char row[96];
+			sprintf_s(row, sizeof(row), "%016llX,%u,%u,%u\n", (unsigned long long)hash, desc.Width, desc.Height, (UINT)desc.Format);
+			stage3BoundManifest << row; stage3BoundManifest.flush();
+		}
+		lvl0->Release();
+	}
+
+	// --- Canonical Identity Layer helpers (2026-06-09) ---
+
+	std::string canonBaseDir;
+
+	// One-time sidecar load from <gamedir>\_canonical\ (generated offline by
+	// _scratch_discovery\canon_build_sidecars.py from a stage3_bound capture run).
+	void EnsureCanonSidecarsLoaded()
+	{
+		if (canonSidecarsLoaded) return;
+		canonSidecarsLoaded = true;
+		char modulePath[MAX_PATH] = {};
+		GetModuleFileNameA(nullptr, modulePath, MAX_PATH);
+		std::string gameDir = modulePath;
+		auto slash = gameDir.find_last_of("\\/");
+		if (slash != std::string::npos) gameDir = gameDir.substr(0, slash);
+		canonBaseDir = gameDir + "\\_canonical";
+
+		// canon_fps.bin: 'CFP1' + uint32 count + entries{uint64 hash, uint16 w, uint16 h, uint8 fp[1024]}
+		std::ifstream f(canonBaseDir + "\\canon_fps.bin", std::ios::binary);
+		char magic[4] = {};
+		uint32_t count = 0;
+		if (!f.read(magic, 4) || memcmp(magic, "CFP1", 4) != 0 || !f.read((char*)&count, 4) || count == 0 || count > 100000)
+		{
+			canonDisabled = true;
+			Logging::Log() << "[CANON] DISABLED: canon_fps.bin missing/corrupt at " << canonBaseDir.c_str();
+			return;
+		}
+		canonFps.resize(count);
+		for (uint32_t i = 0; i < count; i++)
+		{
+			CanonFpEntry& e = canonFps[i];
+			if (!f.read((char*)&e.hash, 8) || !f.read((char*)&e.w, 2) || !f.read((char*)&e.h, 2) || !f.read((char*)e.fp, 1024))
+			{
+				canonDisabled = true;
+				canonFps.clear();
+				canonHashSet.clear();
+				Logging::Log() << "[CANON] DISABLED: canon_fps.bin truncated at entry " << i;
+				return;
+			}
+			canonHashSet.insert(e.hash);
+		}
+
+		// canon_map.csv: "runtime_hash,canon_hash" 16-hex pairs; header/malformed lines skipped.
+		std::ifstream m(canonBaseDir + "\\canon_map.csv");
+		std::string line;
+		size_t mapRows = 0;
+		while (std::getline(m, line))
+		{
+			if (line.size() < 33 || line[16] != ',') continue;
+			uint64_t rh = strtoull(line.substr(0, 16).c_str(), nullptr, 16);
+			uint64_t ch = strtoull(line.substr(17, 16).c_str(), nullptr, 16);
+			if (rh && ch && canonHashSet.count(ch)) { canonMapRuntimeToCanon[rh] = ch; mapRows++; }
+		}
+		// [NAMEKEY] name_map.csv (2026-06-11): "name,canon_hash,l2,margin,src_png".
+		// Key = EngineTextures fullname + "MM{mip}" -- exactly what the upload detour
+		// computes at runtime. Names may contain backslashes/spaces; first field up to
+		// the comma, hash is the 16 hex chars after it. Lowercased for lookup.
+		if (Config.DdrawNameKey)
+		{
+			std::ifstream nm(canonBaseDir + "\\name_map.csv");
+			std::string nline;
+			bool nFirst = true;
+			while (std::getline(nm, nline))
+			{
+				if (nFirst) { nFirst = false; continue; }	// header
+				auto c1 = nline.find(',');
+				if (c1 == std::string::npos || c1 == 0 || nline.size() < c1 + 17) continue;
+				std::string key = nline.substr(0, c1);
+				uint64_t ch = strtoull(nline.substr(c1 + 1, 16).c_str(), nullptr, 16);
+				if (!ch || !canonHashSet.count(ch)) continue;
+				for (auto& c : key) c = (char)tolower((unsigned char)c);
+				namekeyNameToCanon[key] = ch;
+			}
+			char nbuf[140];
+			sprintf_s(nbuf, sizeof(nbuf), "[NAMEKEY] INIT keys=%zu mode=%lu", namekeyNameToCanon.size(), (unsigned long)Config.DdrawNameKey);
+			Logging::Log() << nbuf;
+
+			// V2 crop sidecar index: "CRP1" + u32 count + {u64 keyhash, u32 absOffset,
+			// u16 w, u16 h}*count + payload blobs (read lazily). ~90KB resident.
+			if (Config.DdrawNameKeyCrop)
+			{
+				std::ifstream cf(canonBaseDir + "\\crop_payloads.bin", std::ios::binary);
+				char cmagic[4] = {};
+				uint32_t ccount = 0;
+				if (cf.read(cmagic, 4) && memcmp(cmagic, "CRP1", 4) == 0 && cf.read((char*)&ccount, 4) && ccount > 0 && ccount < 100000)
+				{
+					namekeyCropIdx.reserve(ccount);
+					for (uint32_t i = 0; i < ccount; i++)
+					{
+						uint64_t kh = 0; NamekeyCropIdxEnt e{};
+						if (!cf.read((char*)&kh, 8) || !cf.read((char*)&e.off, 4) || !cf.read((char*)&e.w, 2) || !cf.read((char*)&e.h, 2))
+						{
+							namekeyCropIdx.clear();
+							Logging::Log() << "[NAMEKEY] CROPIDX DISABLED: crop_payloads.bin truncated at entry " << i;
+							break;
+						}
+						namekeyCropIdx.emplace(kh, e);
+					}
+				}
+				else
+				{
+					Logging::Log() << "[NAMEKEY] CROPIDX DISABLED: crop_payloads.bin missing/corrupt at " << canonBaseDir.c_str();
+				}
+				if (!namekeyCropIdx.empty())
+				{
+					char cbuf[160];
+					sprintf_s(cbuf, sizeof(cbuf), "[NAMEKEY] CROPIDX entries=%zu mode=%lu", namekeyCropIdx.size(), (unsigned long)Config.DdrawNameKeyCrop);
+					Logging::Log() << cbuf;
+				}
+			}
+		}
+
+		char buf[300];
+		sprintf_s(buf, sizeof(buf), "[CANON] INIT fps=%u map=%zu dir=%s", count, mapRows, canonBaseDir.c_str());
+		Logging::Log() << buf;
+	}
+
+	// Read a canonical payload file ('A4R4' + w + h + packed 16-bit rows).
+	// Returns false (with a log) on any problem.
+	bool CanonReadPayload(uint64_t h, uint32_t& w, uint32_t& ht, std::vector<uint8_t>& payload)
+	{
+		char path[MAX_PATH];
+		sprintf_s(path, sizeof(path), "%s\\tex\\%016llX.a4r4", canonBaseDir.c_str(), (unsigned long long)h);
+		std::ifstream f(path, std::ios::binary);
+		char magic[4] = {};
+		w = ht = 0;
+		if (!f.read(magic, 4) || memcmp(magic, "A4R4", 4) != 0 ||
+			!f.read((char*)&w, 4) || !f.read((char*)&ht, 4) ||
+			w == 0 || ht == 0 || w > 4096 || ht > 4096)
+		{
+			Logging::Log() << "[CANON] tex file missing/corrupt: " << path;
+			return false;
+		}
+		payload.resize((size_t)w * ht * 2);
+		if (!f.read((char*)payload.data(), payload.size()))
+		{
+			Logging::Log() << "[CANON] tex file truncated: " << path;
+			return false;
+		}
+		return true;
+	}
+
+	// Pixel verifier: compare a runtime A4R4G4B4 texture's mip 0 against a
+	// canonical payload. True = same content (a drift variant), safe to rebind.
+	// See the comment at kCanonVerifyBigDiffNibbles for why fingerprints alone
+	// are not sufficient. Alpha is ignored (4-bit alpha noise IS the drift).
+	bool CanonVerifyAgainstPayload(IDirect3DTexture9* tex, const std::vector<uint8_t>& payload, uint32_t w, uint32_t ht, float* outBigFrac)
+	{
+		if (outBigFrac) *outBigFrac = 1.0f;
+		IDirect3DSurface9* lvl0 = nullptr;
+		if (FAILED(tex->GetSurfaceLevel(0, &lvl0)) || !lvl0) return false;
+		D3DSURFACE_DESC desc = {};
+		bool ok = false;
+		if (SUCCEEDED(lvl0->GetDesc(&desc)) && desc.Format == D3DFMT_A4R4G4B4 && desc.Width == w && desc.Height == ht)
+		{
+			D3DLOCKED_RECT lr = {};
+			if (SUCCEEDED(lvl0->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
+			{
+				DWORD big = 0;
+				const uint16_t* canon = (const uint16_t*)payload.data();
+				for (uint32_t y = 0; y < ht; y++)
+				{
+					const uint16_t* row = (const uint16_t*)((const uint8_t*)lr.pBits + (size_t)y * lr.Pitch);
+					const uint16_t* crow = canon + (size_t)y * w;
+					for (uint32_t x = 0; x < w; x++)
+					{
+						const int dr = abs((int)((row[x] >> 8) & 0xF) - (int)((crow[x] >> 8) & 0xF));
+						const int dg = abs((int)((row[x] >> 4) & 0xF) - (int)((crow[x] >> 4) & 0xF));
+						const int db = abs((int)(row[x] & 0xF) - (int)(crow[x] & 0xF));
+						if (dr > kCanonVerifyBigDiffNibbles || dg > kCanonVerifyBigDiffNibbles || db > kCanonVerifyBigDiffNibbles) big++;
+					}
+				}
+				lvl0->UnlockRect();
+				const float frac = (float)big / (float)(w * ht);
+				if (outBigFrac) *outBigFrac = frac;
+				// 0.0025 (was 0.01): co-atlased tooltip/icon differences ran
+				// 0.003-0.0099 and passed the 1% gate (visible bed mixup,
+				// 2026-06-10). Must match the offline gate in canon_assign_map.py.
+				ok = (frac < 0.0025f);
+			}
+		}
+		lvl0->Release();
+		return ok;
+	}
+
+	// --- [NAMEKEY] V2 helpers (2026-06-11) ------------------------------------------
+
+	// Lazy payload read from crop_payloads.bin (index loaded at sidecar init; one
+	// small seek+read per first synthesis of a sprite).
+	bool NamekeyCropReadPayload(const NamekeyCropIdxEnt& e, std::vector<uint8_t>& payload)
+	{
+		std::ifstream f(canonBaseDir + "\\crop_payloads.bin", std::ios::binary);
+		payload.resize((size_t)e.w * e.h * 2);
+		if (!f.seekg(e.off) || !f.read((char*)payload.data(), payload.size()))
+		{
+			payload.clear();
+			return false;
+		}
+		return true;
+	}
+
+	// Rect-scoped pixel verifier: compare the page's mip-0 rect against an expected
+	// payload. Mirrors CanonVerifyAgainstPayload (RGB nibbles, big-diff threshold,
+	// frac<0.0025; alpha ignored -- 4-bit alpha noise IS the drift). Returns 0=match,
+	// 1=content mismatch, 2=bad format/bounds, 3=lock failure.
+	int NamekeyCropVerifyRect(IDirect3DTexture9* pageTex, long rx, long ry,
+		const std::vector<uint8_t>& payload, uint32_t w, uint32_t h, float* outBigFrac)
+	{
+		if (outBigFrac) *outBigFrac = 1.0f;
+		IDirect3DSurface9* lvl0 = nullptr;
+		if (FAILED(pageTex->GetSurfaceLevel(0, &lvl0)) || !lvl0) return 3;
+		D3DSURFACE_DESC desc = {};
+		int rc = 2;
+		if (SUCCEEDED(lvl0->GetDesc(&desc)) && desc.Format == D3DFMT_A4R4G4B4 &&
+			rx >= 0 && ry >= 0 && rx + (long)w <= (long)desc.Width && ry + (long)h <= (long)desc.Height)
+		{
+			rc = 3;
+			D3DLOCKED_RECT lr = {};
+			if (SUCCEEDED(lvl0->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
+			{
+				DWORD big = 0;
+				const uint16_t* canon = (const uint16_t*)payload.data();
+				for (uint32_t y = 0; y < h; y++)
+				{
+					const uint16_t* row = (const uint16_t*)((const uint8_t*)lr.pBits + (size_t)(ry + y) * lr.Pitch) + rx;
+					const uint16_t* crow = canon + (size_t)y * w;
+					for (uint32_t x = 0; x < w; x++)
+					{
+						const int dr = abs((int)((row[x] >> 8) & 0xF) - (int)((crow[x] >> 8) & 0xF));
+						const int dg = abs((int)((row[x] >> 4) & 0xF) - (int)((crow[x] >> 4) & 0xF));
+						const int db = abs((int)(row[x] & 0xF) - (int)(crow[x] & 0xF));
+						if (dr > kCanonVerifyBigDiffNibbles || dg > kCanonVerifyBigDiffNibbles || db > kCanonVerifyBigDiffNibbles) big++;
+					}
+				}
+				lvl0->UnlockRect();
+				const float frac = (float)big / (float)(w * h);
+				if (outBigFrac) *outBigFrac = frac;
+				rc = (frac < 0.0025f) ? 0 : 1;	// gate matches CanonVerifyAgainstPayload + canon_assign_map.py
+			}
+		}
+		lvl0->Release();
+		return rc;
+	}
+
+	// Build (or fetch) the canonical crop texture for a payload. A4R4G4B4 MANAGED,
+	// mip-0 = payload verbatim (Remix hash == payloadHash by construction), full mip
+	// chain filtered from it. Pre-seeds the Stage3/canon caches exactly like
+	// CanonGetOrCreateTexture so binds count under the known hash and never rebind.
+	// The map holds the OWNER reference; univDrawCache entries AddRef/Release on top.
+	IDirect3DTexture9* NamekeyCropGetOrCreateTex(uint64_t payloadHash, const std::vector<uint8_t>& payload,
+		uint32_t w, uint32_t h, LPDIRECT3DDEVICE9* d3d9Device)
+	{
+		auto it = namekeyCropTexByHash.find(payloadHash);
+		if (it != namekeyCropTexByHash.end()) return it->second;
+		if (!d3d9Device || !*d3d9Device) return nullptr;	// don't negative-cache: device may exist next draw
+		if (namekeyCropTexCreated >= kNamekeyCropTexCap) return nullptr;
+		IDirect3DTexture9* tex = nullptr;
+		if (FAILED((*d3d9Device)->CreateTexture(w, h, 0, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED, &tex, nullptr)) || !tex)
+		{
+			namekeyCropTexByHash[payloadHash] = nullptr;
+			return nullptr;
+		}
+		D3DLOCKED_RECT lr = {};
+		if (FAILED(tex->LockRect(0, &lr, nullptr, 0)))
+		{
+			tex->Release();
+			namekeyCropTexByHash[payloadHash] = nullptr;
+			return nullptr;
+		}
+		const size_t rowBytes = (size_t)w * 2;
+		for (uint32_t y = 0; y < h; y++)
+		{
+			memcpy((uint8_t*)lr.pBits + (size_t)y * lr.Pitch, payload.data() + (size_t)y * rowBytes, rowBytes);
+		}
+		tex->UnlockRect(0);
+		if (tex->GetLevelCount() > 1)
+		{
+			D3DXFilterTexture(tex, nullptr, 0, D3DX_FILTER_LINEAR);
+		}
+		stage3HashByD3d9Tex[tex] = payloadHash;
+		stage3DumpedHashes.insert(payloadHash);
+		canonResolveByTex[tex] = nullptr;	// a canonical never rebinds further
+		namekeyCropTexByHash[payloadHash] = tex;
+		namekeyCropTexCreated++;
+		return tex;
+	}
+
+	// Load (or return cached) canonical texture for a canonical hash. MANAGED
+	// A4R4G4B4 with a full mip chain; mip-0 bytes are the .a4r4 payload verbatim,
+	// so Remix's XXH3 over packed mip 0 EQUALS `h` by construction. A null cache
+	// entry means a prior load failed -- never retried.
+	IDirect3DTexture9* CanonGetOrCreateTexture(uint64_t h, LPDIRECT3DDEVICE9* d3d9Device)
+	{
+		auto it = canonTexByHash.find(h);
+		if (it != canonTexByHash.end()) return it->second;
+		if (!d3d9Device || !*d3d9Device) return nullptr;	// don't negative-cache: device may exist next bind
+		if (canonTexCreatedTotal >= kCanonTexCap)
+		{
+			canonTexByHash[h] = nullptr;
+			return nullptr;
+		}
+
+		uint32_t w = 0, ht = 0;
+		std::vector<uint8_t> payload;
+		if (!CanonReadPayload(h, w, ht, payload))
+		{
+			canonTexByHash[h] = nullptr;
+			return nullptr;
+		}
+
+		IDirect3DTexture9* tex = nullptr;
+		// Levels=0 -> full mip chain; a mip-0-only texture renders as a white
+		// block at far/small draws under Remix (A.10 finding).
+		if (FAILED((*d3d9Device)->CreateTexture(w, ht, 0, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED, &tex, nullptr)) || !tex)
+		{
+			char buf[120];
+			sprintf_s(buf, sizeof(buf), "[CANON] CreateTexture failed for %016llX", (unsigned long long)h);
+			Logging::Log() << buf;
+			canonTexByHash[h] = nullptr;
+			return nullptr;
+		}
+		D3DLOCKED_RECT lr = {};
+		if (FAILED(tex->LockRect(0, &lr, nullptr, 0)))
+		{
+			tex->Release();
+			canonTexByHash[h] = nullptr;
+			return nullptr;
+		}
+		const size_t rowBytes = (size_t)w * 2;
+		for (uint32_t y = 0; y < ht; y++)
+		{
+			memcpy((uint8_t*)lr.pBits + (size_t)y * lr.Pitch, payload.data() + (size_t)y * rowBytes, rowBytes);
+		}
+		tex->UnlockRect(0);
+		// FilterTexture fills levels 1+ FROM level 0; mip-0 bytes (the hash) stay intact.
+		if (tex->GetLevelCount() > 1)
+		{
+			D3DXFilterTexture(tex, nullptr, 0, D3DX_FILTER_LINEAR);
+		}
+
+		// Pre-seed Stage 3 so canonical binds count under their known hash without
+		// a redundant lock+rehash, and never self-dump into the bound corpus.
+		stage3HashByD3d9Tex[tex] = h;
+		stage3DumpedHashes.insert(h);
+		canonResolveByTex[tex] = nullptr;	// a canonical never rebinds further
+		canonTexByHash[h] = tex;
+		canonTexCreatedTotal++;
+		char buf[160];
+		sprintf_s(buf, sizeof(buf), "[CANON] CREATE %016llX %ux%u total=%lu", (unsigned long long)h, w, ht, (unsigned long)canonTexCreatedTotal);
+		Logging::Log() << buf;
+		return tex;
+	}
+
+	// Resolve a bound whole-surface texture to its canonical replacement, or
+	// nullptr when none applies. Cached per d3d9 pointer; SetDirtyFlag erases
+	// entries when the surface's content changes.
+	IDirect3DTexture9* CanonResolveImpl(IDirect3DTexture9* tex, LPDIRECT3DDEVICE9* d3d9Device)
+	{
+		auto rIt = canonResolveByTex.find(tex);
+		if (rIt != canonResolveByTex.end())
+		{
+			if (rIt->second) canonRebindBindsTotal++;
+			return rIt->second;
+		}
+
+		EnsureCanonSidecarsLoaded();
+		if (canonDisabled) return nullptr;
+
+		// Reuse / seed the Stage 3 content-hash cache (same key domain: the exact
+		// bound d3d9 pointer). First sight of a hash also feeds the bound-corpus dump.
+		uint64_t h;
+		auto hIt = stage3HashByD3d9Tex.find(tex);
+		if (hIt != stage3HashByD3d9Tex.end())
+		{
+			h = hIt->second;
+		}
+		else
+		{
+			h = Stage3HashD3d9Texture(tex);
+			stage3HashByD3d9Tex[tex] = h;
+			Stage3MaybeDumpBound(tex, h, false);
+		}
+		if (h == 0)
+		{
+			canonResolveByTex[tex] = nullptr;
+			return nullptr;
+		}
+
+		uint64_t canonHash = 0;
+
+		// [NAMEKEY] (2026-06-11): exact-identity resolution, attempted before any
+		// content-similarity machinery. The pixel verifier stays in the loop as the
+		// guard against recipe mis-attribution (wrong page attached) and wrong-twin
+		// map rows -- a failed verify falls through to the legacy path.
+		uint64_t nameCanon = 0;
+		bool nameVerified = false;
+		char nameKeyStr[128] = {};
+		if (Config.DdrawNameKey && !canonHashSet.count(h))
+		{
+			nameCanon = NamekeyLookupCanon(tex, nameKeyStr, sizeof(nameKeyStr));
+			if (nameCanon)
+			{
+				uint32_t ncw = 0, nch = 0;
+				std::vector<uint8_t> npayload;
+				float nBigFrac = 1.0f;
+				if (CanonReadPayload(nameCanon, ncw, nch, npayload) &&
+					CanonVerifyAgainstPayload(tex, npayload, ncw, nch, &nBigFrac))
+				{
+					nameVerified = true;
+					namekeyResolves++;
+				}
+				else
+				{
+					namekeyVerifyFails++;
+					char buf[240];
+					sprintf_s(buf, sizeof(buf), "[NAMEKEY] VERIFYFAIL runtime=%016llX name=%s canon=%016llX bigfrac=%.4f",
+						(unsigned long long)h, nameKeyStr, (unsigned long long)nameCanon, nBigFrac);
+					Logging::Log() << buf;
+				}
+			}
+		}
+
+		if (canonHashSet.count(h))
+		{
+			// Content already presents a canonical hash: Remix sees the right key
+			// with no rebind, and mods keyed on it already fire.
+			canonIdentityTotal++;
+		}
+		else if (Config.DdrawNameKey >= 2 && nameVerified)
+		{
+			// Name key authoritative: exact identity, pixel-verified. Warm the hash
+			// map so repeats (and canon_assign_map.py's offline rebuild) see it.
+			canonHash = nameCanon;
+			canonMapRuntimeToCanon[h] = canonHash;
+			char buf[240];
+			sprintf_s(buf, sizeof(buf), "[NAMEKEY] MATCH runtime=%016llX -> canon=%016llX name=%s",
+				(unsigned long long)h, (unsigned long long)nameCanon, nameKeyStr);
+			Logging::Log() << buf;
+		}
+		else
+		{
+			auto mIt = canonMapRuntimeToCanon.find(h);
+			if (mIt != canonMapRuntimeToCanon.end())
+			{
+				canonHash = mIt->second;
+			}
+			else
+			{
+				// Unknown content: one-time fingerprint match against the canonical
+				// corpus. Dims must agree -- never swap detail levels.
+				D3DSURFACE_DESC desc = {};
+				IDirect3DSurface9* lvl0 = nullptr;
+				if (SUCCEEDED(tex->GetSurfaceLevel(0, &lvl0)) && lvl0)
+				{
+					lvl0->GetDesc(&desc);
+					lvl0->Release();
+				}
+				uint8_t fp[1024];
+				if (desc.Width && ComputeFingerprintFromTexture(tex, d3d9Device, fp))
+				{
+					float best = 1e30f, second = 1e30f;
+					uint64_t bestHash = 0;
+					for (const CanonFpEntry& e : canonFps)
+					{
+						if (e.w != desc.Width || e.h != desc.Height) continue;
+						float d = FingerprintL2(fp, e.fp);
+						if (d < best) { second = best; best = d; bestHash = e.hash; }
+						else if (d < second) { second = d; }
+					}
+					char buf[240];
+					if (bestHash && best < kFingerprintL2Threshold)
+					{
+						// Fingerprint retrieval found a candidate; the PIXEL
+						// verifier decides (fingerprints can't see quadrant-level
+						// content swaps -- 2026-06-09 session audit).
+						uint32_t cw = 0, chh = 0;
+						std::vector<uint8_t> cpayload;
+						float bigFrac = 1.0f;
+						if (CanonReadPayload(bestHash, cw, chh, cpayload) &&
+							CanonVerifyAgainstPayload(tex, cpayload, cw, chh, &bigFrac))
+						{
+							canonHash = bestHash;
+							canonMapRuntimeToCanon[h] = canonHash;	// session-warm; canon_assign_map.py rebuilds the durable map offline
+							canonFpMatchTotal++;
+							sprintf_s(buf, sizeof(buf), "[CANON] FPMATCH runtime=%016llX -> canon=%016llX L2=%.1f second=%.1f bigfrac=%.4f",
+								(unsigned long long)h, (unsigned long long)canonHash, best, second, bigFrac);
+							Logging::Log() << buf;
+						}
+						else
+						{
+							canonFpRejectTotal++;
+							sprintf_s(buf, sizeof(buf), "[CANON] FPREJECT runtime=%016llX candidate=%016llX L2=%.1f bigfrac=%.4f",
+								(unsigned long long)h, (unsigned long long)bestHash, best, bigFrac);
+							Logging::Log() << buf;
+						}
+					}
+					else
+					{
+						canonFpNoMatchTotal++;
+						sprintf_s(buf, sizeof(buf), "[CANON] FPNOMATCH runtime=%016llX bestL2=%.1f (threshold=%.0f)",
+							(unsigned long long)h, best, kFingerprintL2Threshold);
+						Logging::Log() << buf;
+					}
+				}
+			}
+
+			// [NAMEKEY] shadow mode: the legacy path just decided; compare what the
+			// (verified) name key would have done. Disagreements are exactly the
+			// mixup class the fingerprint path was historically vulnerable to.
+			if (Config.DdrawNameKey == 1 && nameVerified)
+			{
+				char buf[280];
+				if (canonHash && canonHash == nameCanon)
+				{
+					namekeyShadowAgree++;
+				}
+				else if (canonHash)
+				{
+					namekeyShadowDisagree++;
+					sprintf_s(buf, sizeof(buf), "[NAMEKEY] SHADOW_DISAGREE runtime=%016llX name=%s nameCanon=%016llX legacyCanon=%016llX",
+						(unsigned long long)h, nameKeyStr, (unsigned long long)nameCanon, (unsigned long long)canonHash);
+					Logging::Log() << buf;
+				}
+				else
+				{
+					namekeyShadowOnly++;
+					sprintf_s(buf, sizeof(buf), "[NAMEKEY] SHADOW_ONLY runtime=%016llX name=%s nameCanon=%016llX (legacy path found nothing)",
+						(unsigned long long)h, nameKeyStr, (unsigned long long)nameCanon);
+					Logging::Log() << buf;
+				}
+			}
+		}
+
+		IDirect3DTexture9* canon = canonHash ? CanonGetOrCreateTexture(canonHash, d3d9Device) : nullptr;
+		canonResolveByTex[tex] = canon;
+		if (canon) canonRebindBindsTotal++;
+		return canon;
+	}
+
+	// Stage 3 (2026-05-27): periodic dump of per-surface + per-hash bind stats.
+	// Called from Stage3OnRemixBind below (which IDirect3DDeviceX.cpp invokes on
+	// every d3d9 SetTexture binding), so cadence is stable as long as the game draws.
+	void Stage3DumpIfDue()
+	{
+		DWORD now = GetTickCount();
+		if (stage3LastDumpMs == 0) { stage3LastDumpMs = now; return; }
+		if (now - stage3LastDumpMs < kStage3DumpIntervalMs) return;
+		stage3LastDumpMs = now;
+
+		struct Row { void* surf; DWORD total; Stage3SurfaceStat s; };
+		std::vector<Row> rows; rows.reserve(stage3PerSurface.size());
+		DWORD totHits=0, totCrops=0, totInvals=0, totScar=0, totBL=0;
+		for (auto& kv : stage3PerSurface) {
+			DWORD t = kv.second.hits + kv.second.crops + kv.second.invals + kv.second.scarcitySkips + kv.second.blacklistSkips;
+			rows.push_back({kv.first, t, kv.second});
+			totHits += kv.second.hits; totCrops += kv.second.crops; totInvals += kv.second.invals;
+			totScar += kv.second.scarcitySkips; totBL += kv.second.blacklistSkips;
+		}
+		std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b){ return a.total > b.total; });
+		{
+			char buf[260];
+			sprintf_s(buf, sizeof(buf), "[STAGE3] PER_SURFACE_SUMMARY surfaces=%zu hits=%lu crops=%lu invals=%lu scarcity=%lu blacklist=%lu",
+				rows.size(), (unsigned long)totHits, (unsigned long)totCrops,
+				(unsigned long)totInvals, (unsigned long)totScar, (unsigned long)totBL);
+			Logging::Log() << buf;
+		}
+		const size_t topN = (rows.size() < 20) ? rows.size() : 20;
+		for (size_t i = 0; i < topN; ++i) {
+			const Row& r = rows[i];
+			char buf[220];
+			sprintf_s(buf, sizeof(buf), "[STAGE3] SURF #%zu %p total=%lu hits=%lu crops=%lu invals=%lu scar=%lu bl=%lu",
+				i, r.surf, (unsigned long)r.total,
+				(unsigned long)r.s.hits, (unsigned long)r.s.crops, (unsigned long)r.s.invals,
+				(unsigned long)r.s.scarcitySkips, (unsigned long)r.s.blacklistSkips);
+			Logging::Log() << buf;
+		}
+
+		struct HRow { uint64_t h; DWORD total; Stage3BindStat s; };
+		std::vector<HRow> hr; hr.reserve(stage3BindByHash.size());
+		DWORD bWhole=0, bCrop=0;
+		for (auto& kv : stage3BindByHash) {
+			hr.push_back({kv.first, kv.second.wholeBinds + kv.second.cropBinds, kv.second});
+			bWhole += kv.second.wholeBinds; bCrop += kv.second.cropBinds;
+		}
+		std::sort(hr.begin(), hr.end(), [](const HRow& a, const HRow& b){ return a.total > b.total; });
+		{
+			char buf[260];
+			sprintf_s(buf, sizeof(buf), "[STAGE3] BIND_SUMMARY uniqueHashes=%zu whole=%lu crop=%lu wholeUnhashed=%lu cropUnhashed=%lu",
+				hr.size(), (unsigned long)bWhole, (unsigned long)bCrop,
+				(unsigned long)stage3WholeBindsUnhashed, (unsigned long)stage3CropBindsUnhashed);
+			Logging::Log() << buf;
+
+			// [RECIPE] (2026-06-10): tracked-destination + emission health counters.
+			if (Config.DdrawRecipeLog)
+			{
+				sprintf_s(buf, sizeof(buf), "[RECIPE] SUMMARY tracked=%zu emitted=%zu srcCache=%zu surfacesDropped=%lu",
+					recipeByTex.size(), recipeEmitted.size(), recipeSrcHashCache.size(), (unsigned long)recipeSurfacesDropped);
+				Logging::Log() << buf;
+			}
+
+			// [OWNUP] (2026-06-10): upload-detour health + distinct-identity count.
+			if (Config.DdrawOwnerLog)
+			{
+				sprintf_s(buf, sizeof(buf), "[OWNUP] SUMMARY calls=%lu badReads=%lu distinctIdentities=%zu",
+					(unsigned long)ownupCalls, (unsigned long)ownupBadReads, ownupSeen.size());
+				Logging::Log() << buf;
+			}
+
+			// [NAMEKEY] (2026-06-11): recorder/consume/resolve health.
+			if (Config.DdrawNameKey)
+			{
+				char nbuf[420];
+				sprintf_s(nbuf, sizeof(nbuf), "[NAMEKEY] SUMMARY placements=%lu overflow=%lu consumes=%lu orphan=%lu multi=%lu recipes=%zu resolves=%lu verifyFail=%lu noRecipe=%lu multiName=%lu subPage=%lu unmapped=%lu distinctUnmapped=%zu shadowAgree=%lu shadowDisagree=%lu shadowOnly=%lu",
+					(unsigned long)namekeyPlacements, (unsigned long)namekeyAccumOverflow, (unsigned long)namekeyConsumes,
+					(unsigned long)namekeyOrphanConsumes, (unsigned long)namekeyMultiComp, namekeyRecipeByTex.size(),
+					(unsigned long)namekeyResolves, (unsigned long)namekeyVerifyFails, (unsigned long)namekeyNoRecipe,
+					(unsigned long)namekeyNotSingleMulti, (unsigned long)namekeyNotSingleSub, (unsigned long)namekeyUnmapped,
+					namekeyUnmappedSeen.size(), (unsigned long)namekeyShadowAgree,
+					(unsigned long)namekeyShadowDisagree, (unsigned long)namekeyShadowOnly);
+				Logging::Log() << nbuf;
+
+				// [NAMEKEY] V2 crop-layer health (2026-06-11).
+				if (Config.DdrawNameKeyCrop)
+				{
+					char cbuf[420];
+					sprintf_s(cbuf, sizeof(cbuf), "[NAMEKEY] CROPSUMMARY match=%lu ambig=%lu submiss=%lu noSidecar=%lu dims=%lu fmt=%lu readFail=%lu verifyFail=%lu serveVerifyFail=%lu synth=%lu serve=%lu mm0=%lu waterCol=%lu waterFlat=%lu waterFlatL=%lu dynUi=%lu shadowPass=%lu shadowFail=%lu states=%zu texes=%lu idx=%zu",
+						(unsigned long)namekeyCropMatch, (unsigned long)namekeyCropAmbiguous, (unsigned long)namekeyCropSubmiss,
+						(unsigned long)namekeyCropNoSidecar, (unsigned long)namekeyCropDimsMismatch, (unsigned long)namekeyCropBadFormat,
+						(unsigned long)namekeyCropReadFail, (unsigned long)namekeyCropVerifyFail, (unsigned long)namekeyCropServeVerifyFail,
+						(unsigned long)namekeyCropSynth, (unsigned long)namekeyCropServe, (unsigned long)namekeyCropMm0Collapse,
+						(unsigned long)namekeyWaterCollapse, (unsigned long)namekeyWaterFlatten, (unsigned long)namekeyWaterLarge, (unsigned long)namekeyDynUiDraws,
+						(unsigned long)namekeyCropShadowPass, (unsigned long)namekeyCropShadowFail, namekeyCropByKey.size(),
+						(unsigned long)namekeyCropTexCreated, namekeyCropIdx.size());
+					Logging::Log() << cbuf;
+				}
+			}
+		}
+		const size_t topH = (hr.size() < 30) ? hr.size() : 30;
+		for (size_t i = 0; i < topH; ++i) {
+			char buf[160];
+			sprintf_s(buf, sizeof(buf), "[STAGE3] BIND #%zu %016llX total=%lu whole=%lu crop=%lu",
+				i, (unsigned long long)hr[i].h, (unsigned long)hr[i].total,
+				(unsigned long)hr[i].s.wholeBinds, (unsigned long)hr[i].s.cropBinds);
+			Logging::Log() << buf;
+		}
+
+		if (Config.DdrawCanonicalRebind)
+		{
+			char buf[300];
+			sprintf_s(buf, sizeof(buf), "[CANON] SUMMARY rebindBinds=%lu fpMatch=%lu fpReject=%lu fpNoMatch=%lu identity=%lu texCreated=%lu churnExempt=%lu resolveCache=%zu mapSize=%zu",
+				(unsigned long)canonRebindBindsTotal, (unsigned long)canonFpMatchTotal, (unsigned long)canonFpRejectTotal, (unsigned long)canonFpNoMatchTotal,
+				(unsigned long)canonIdentityTotal, (unsigned long)canonTexCreatedTotal, (unsigned long)canonChurnExemptTotal,
+				canonResolveByTex.size(), canonMapRuntimeToCanon.size());
+			Logging::Log() << buf;
+		}
+	}
 }
+
+// Stage 3 (2026-05-27, fixed 2026-05-29): external-linkage shim called from
+// IDirect3DDeviceX.cpp at every d3d9 SetTexture binding. Hashes the EXACT bound
+// d3d9 texture (cached once per pointer) and increments the per-hash bind counter,
+// then triggers the periodic dump. d3d9Tex may be a whole-surface texture or a
+// synthesized POT crop. Forward-declared in IDirect3DDeviceX.cpp (no header touch).
+//
+// FIX (2026-05-29): the original body looked d3d9Tex up in capState.firstHashByTex,
+// which (a) is only populated when DdrawContentCapture=1 and (b) is keyed by the
+// WRAPPER pointer, not the d3d9 texture pointer the bind sites pass -- so every
+// lookup missed and all binds counted as unhashed. We now hash the bound texture
+// directly and cache by its d3d9 pointer, which both removes the capture-flag
+// dependency and keys on exactly the object Remix receives.
+void Stage3OnRemixBind(IDirect3DTexture9* d3d9Tex, bool isCrop)
+{
+	OwnupInstallHookOnce();   // one-shot, flag-gated (DdrawOwnerLog or DdrawNameKey): arms the 0x58E53B call-site detour once DKII.exe is live
+	if (!d3d9Tex) return;
+	uint64_t h;
+	auto it = stage3HashByD3d9Tex.find(d3d9Tex);
+	if (it != stage3HashByD3d9Tex.end()) {
+		h = it->second;
+	} else {
+		h = Stage3HashD3d9Texture(d3d9Tex);
+		// Cache 0 too: a texture that can't be locked won't become lockable on the
+		// next bind, so don't re-attempt the lock millions of times per session.
+		stage3HashByD3d9Tex[d3d9Tex] = h;
+		// When capture is on, save the runtime-keyed corpus PNG (whole-surface only).
+		Stage3MaybeDumpBound(d3d9Tex, h, isCrop);
+	}
+	if (h == 0) {
+		if (isCrop) stage3CropBindsUnhashed++; else stage3WholeBindsUnhashed++;
+	} else {
+		auto& s = stage3BindByHash[h];
+		if (isCrop) s.cropBinds++; else s.wholeBinds++;
+		// [RECIPE] (2026-06-10): first bind of each distinct whole-surface content hash
+		// emits the composition recipe that produced it (set-guarded inside).
+		if (Config.DdrawRecipeLog && !isCrop)
+		{
+			RecipeEmitForHash(d3d9Tex, h);
+		}
+	}
+	Stage3DumpIfDue();
+}
+
+// Canonical Identity Layer (2026-06-09): external-linkage shim called from
+// IDirect3DDeviceX.cpp at the whole-surface bind site BEFORE SetTexture. Returns
+// the canonical texture to bind instead of `d3d9Tex`, or nullptr to bind the
+// original. See the block comment at the canon globals for the architecture.
+IDirect3DTexture9* Stage3CanonicalResolve(IDirect3DTexture9* d3d9Tex, LPDIRECT3DDEVICE9* d3d9Device)
+{
+	if (!Config.DdrawCanonicalRebind || !d3d9Tex) return nullptr;
+	return CanonResolveImpl(d3d9Tex, d3d9Device);
+}
+
+// Dynamic-UI emissive (2026-06-11): external-linkage accessors for the per-draw
+// classification. IDirect3DDeviceX.cpp resets the flag before its decompose probe
+// (TryGetUniversalSubTextureForUV sets it when the draw's placement resolves to a
+// runtime-rendered UI name), reads it after, and counts applied overrides.
+void NamekeyResetDrawDynUi() { g_namekeyDrawDynUi = false; g_namekeyDrawDynUiAny = false; g_namekeyDrawWater = false; }
+bool NamekeyGetDrawDynUi() { return g_namekeyDrawDynUi; }
+void NamekeyNoteDynUiDraw() { namekeyDynUiDraws++; }
+bool NamekeyGetDrawWater() { return g_namekeyDrawWater; }
+void NamekeyNoteWaterFlatten() { namekeyWaterFlatten++; }
 
 // ******************************
 // IUnknown functions
@@ -882,6 +2490,8 @@ HRESULT m_IDirectDrawSurfaceX::AddOverlayDirtyRect(LPRECT lpRect)
 	return ProxyInterface->AddOverlayDirtyRect(lpRect);
 }
 
+void MenuBlitOverlayEraseRegion(LPRECT lpRect, LONG surfW, LONG surfH);  // [BLITQUAD] v10.3, defined with the overlay block below
+
 HRESULT m_IDirectDrawSurfaceX::Blt(LPRECT lpDestRect, LPDIRECTDRAWSURFACE7 lpDDSrcSurface, LPRECT lpSrcRect, DWORD dwFlags, LPDDBLTFX lpDDBltFx, DWORD MipMapLevel, bool PresentBlt)
 {
 	Logging::LogDebug() << __FUNCTION__ << " (" << this << ")" <<
@@ -904,6 +2514,19 @@ HRESULT m_IDirectDrawSurfaceX::Blt(LPRECT lpDestRect, LPDIRECTDRAWSURFACE7 lpDDS
 		info.width = GetWidth();
 		info.height = GetHeight();
 		info.lastSrc = lpDDSrcSurface;
+	}
+
+	// [MENUDIAG] (2026-06-12): menu text appears in NO geometry path (UP/VB/strided all
+	// covered + telemetried) -- find the CPU channel. Log every Blt whose DEST is the
+	// primary/backbuffer/render target: glyphs composited straight onto the frame are
+	// invisible under the path tracer but present under ortho=True raster passthrough.
+	if (Config.DdrawOrphanOverlayLift && (IsPrimaryOrBackBuffer() || IsRenderTarget()))
+	{
+		LOG_LIMIT(20000, "[MENUDIAG] Blt dest=" << this <<
+			(IsPrimarySurface() ? " PRIMARY" : IsBackBuffer() ? " BACKBUFFER" : " RENDERTARGET") <<
+			" src=" << lpDDSrcSurface <<
+			" destRect=" << lpDestRect << " srcRect=" << lpSrcRect <<
+			" flags=" << Logging::hex(dwFlags));
 	}
 
 	// Path B: animation-pool collapse detection + cycling canonical.
@@ -1116,6 +2739,13 @@ HRESULT m_IDirectDrawSurfaceX::Blt(LPRECT lpDestRect, LPDIRECTDRAWSURFACE7 lpDDS
 				// Do color fill
 				if (dwFlags & DDBLT_COLORFILL)
 				{
+					// [BLITQUAD] v11: fills on either screen surface erase that canvas
+					// region (mid-cycle fill+rewrite resolves before the EndScene drain,
+					// so per-cycle scratch churn no longer flashes).
+					if (Config.DdrawMenuBlitOverlay && (IsPrimaryOrBackBuffer() || IsRenderTarget()))
+					{
+						MenuBlitOverlayEraseRegion(lpDestRect, (LONG)surface.Width, (LONG)surface.Height);
+					}
 					hr = ColorFill(lpDestRect, lpDDBltFx->dwFillColor, MipMapLevel);
 					break;
 				}
@@ -1194,6 +2824,89 @@ HRESULT m_IDirectDrawSurfaceX::Blt(LPRECT lpDestRect, LPDIRECTDRAWSURFACE7 lpDDS
 			// If successful
 			if (SUCCEEDED(hr))
 			{
+				// [BLITQUAD] (2026-06-12 menu-text fix): the front end composites its UI
+				// (text!) via 2D Blts straight onto the backbuffer, which the path tracer
+				// discards. Queue a copy of each such blit; the device re-emits them as
+				// lifted self-lit quads at EndScene. Fills excluded (fullscreen clears).
+				if (Config.DdrawMenuBlitOverlay && lpDDSrcSurfaceX && !(dwFlags & DDBLT_COLORFILL) &&
+					(IsPrimaryOrBackBuffer() || IsRenderTarget()))
+				{
+					DWORD nativeKey = 0;
+					bool hasKey = false;
+					if (dwFlags & DDBLT_KEYSRCOVERRIDE)
+					{
+						nativeKey = lpDDBltFx->ddckSrcColorkey.dwColorSpaceLowValue;
+						hasKey = true;
+					}
+					else if ((dwFlags & DDBLT_KEYSRC) && (lpDDSrcSurfaceX->surfaceDesc2.dwFlags & DDSD_CKSRCBLT))
+					{
+						nativeKey = lpDDSrcSurfaceX->surfaceDesc2.ddckCKSrcBlt.dwColorSpaceLowValue;
+						hasKey = true;
+					}
+					MenuBlitOverlayQueue(lpDDSrcSurfaceX, lpSrcRect, lpDestRect, hasKey, nativeKey);
+				}
+
+				// [RECIPE] (2026-06-10): record this Blt into the dest texture's composition
+				// recipe. Source identity = mip-0 content hash, cached per wrapper ptr and
+				// invalidated by UniquenessValue (bumped by SetDirtyFlag on every write).
+				// Fills/self-blts get sentinel markers instead of a content hash.
+				if (Config.DdrawRecipeLog && IsSurfaceTexture() && surface.Texture)
+				{
+					uint64_t srcH = 0;
+					const bool isFill = (dwFlags & DDBLT_COLORFILL) ||
+						((dwFlags & DDBLT_ROP) && lpDDBltFx && (lpDDBltFx->dwROP == BLACKNESS || lpDDBltFx->dwROP == WHITENESS));
+					if (isFill)
+					{
+						const DWORD fill = (dwFlags & DDBLT_COLORFILL) ? lpDDBltFx->dwFillColor :
+							(lpDDBltFx->dwROP == WHITENESS ? 0xFFFFFFFF : 0x00000000);
+						srcH = 0xF111000000000000ull | fill;	// fill marker
+					}
+					else if (lpDDSrcSurfaceX == this)
+					{
+						srcH = 0x5E1F000000000000ull;			// self-blt marker (pre-write hash would be stale)
+					}
+					else if (lpDDSrcSurfaceX->IsSurfaceTexture() && lpDDSrcSurfaceX->surface.Texture)
+					{
+						recipeBltSources.insert((void*)lpDDSrcSurfaceX);	// [LOCKW] track staging surfaces
+						auto& ce = recipeSrcHashCache[(void*)lpDDSrcSurfaceX];
+						if (ce.second == 0 || ce.first != lpDDSrcSurfaceX->UniquenessValue)
+						{
+							ce.first = lpDDSrcSurfaceX->UniquenessValue;
+							ce.second = Stage3HashD3d9Texture(lpDDSrcSurfaceX->surface.Texture);
+						}
+						srcH = ce.second;
+					}
+					const RECT sR = lpSrcRect ? *lpSrcRect :
+						RECT{ 0, 0, (LONG)lpDDSrcSurfaceX->surface.Width, (LONG)lpDDSrcSurfaceX->surface.Height };
+					const RECT dR = lpDestRect ? *lpDestRect :
+						RECT{ 0, 0, (LONG)surface.Width, (LONG)surface.Height };
+					RecipeRecordBlt(surface.Texture, srcH, sR, dR, surface.Width, surface.Height);
+					recipeLastBltTex = surface.Texture;
+				}
+
+				// [NAMEKEY] (2026-06-11): a full-surface verbatim texture->texture copy
+				// is the staging-page upload shape ([RECIPE] runs A/B: ~99% of dest
+				// content arrives exactly this way). Attach the placements the upload
+				// detour accumulated for this composition to the dest texture.
+				// (BltFast funnels through Blt, so this one site covers both.)
+				if (Config.DdrawNameKey && IsSurfaceTexture() && surface.Texture &&
+					lpDDSrcSurfaceX && lpDDSrcSurfaceX != this &&
+					!(dwFlags & DDBLT_COLORFILL) && !(dwFlags & DDBLT_ROP) &&
+					lpDDSrcSurfaceX->surface.Width == surface.Width &&
+					lpDDSrcSurfaceX->surface.Height == surface.Height)
+				{
+					const RECT nsR = lpSrcRect ? *lpSrcRect :
+						RECT{ 0, 0, (LONG)lpDDSrcSurfaceX->surface.Width, (LONG)lpDDSrcSurfaceX->surface.Height };
+					const RECT ndR = lpDestRect ? *lpDestRect :
+						RECT{ 0, 0, (LONG)surface.Width, (LONG)surface.Height };
+					if (nsR.left == 0 && nsR.top == 0 && ndR.left == 0 && ndR.top == 0 &&
+						nsR.right == (LONG)surface.Width && nsR.bottom == (LONG)surface.Height &&
+						ndR.right == (LONG)surface.Width && ndR.bottom == (LONG)surface.Height)
+					{
+						NamekeyConsumeAt(surface.Texture, surface.Width, surface.Height);
+					}
+				}
+
 				// Set vertical sync wait timer
 				if (SUCCEEDED(c_hr) && (dwFlags & DDBLT_DDFX) && (lpDDBltFx->dwDDFX & DDBLTFX_NOTEARING))
 				{
@@ -1202,8 +2915,8 @@ HRESULT m_IDirectDrawSurfaceX::Blt(LPRECT lpDestRect, LPDIRECTDRAWSURFACE7 lpDDS
 
 				if (PresentBlt)
 				{
-					// Set dirty flag
-					SetDirtyFlag(MipMapLevel);
+					// Set dirty flag (with the specific Blt dest rect for per-rect cache invalidation)
+					SetDirtyFlag(MipMapLevel, lpDestRect);
 
 					// Present surface
 					EndWritePresent(lpDestRect, IsSkipScene);
@@ -2241,6 +3954,13 @@ HRESULT m_IDirectDrawSurfaceX::GetDC(HDC FAR* lphDC, DWORD MipMapLevel)
 		" lpDC = " << (void*)lphDC <<
 		" MipMapLevel = " << MipMapLevel;
 
+	// [MENUDIAG]: GDI text (TextOut on a surface DC) is invisible to all draw/Blt paths.
+	if (Config.DdrawOrphanOverlayLift)
+	{
+		LOG_LIMIT(1000, "[MENUDIAG] GetDC surf=" << this <<
+			(IsPrimarySurface() ? " PRIMARY" : IsBackBuffer() ? " BACKBUFFER" : IsSurfaceTexture() ? " TEXTURE" : " OTHER"));
+	}
+
 	if (Config.Dd7to9)
 	{
 		if (!lphDC)
@@ -2779,9 +4499,26 @@ HRESULT m_IDirectDrawSurfaceX::IsLost()
 	return ProxyInterface->IsLost();
 }
 
+void MenuBlitOverlayMarkLockDirty(m_IDirectDrawSurfaceX* pSurf);  // defined with the [BLITQUAD] block below
+
 HRESULT m_IDirectDrawSurfaceX::Lock(LPRECT lpDestRect, LPDDSURFACEDESC lpDDSurfaceDesc, DWORD dwFlags, HANDLE hEvent, DWORD MipMapLevel, DWORD DirectXVersion)
 {
 	Logging::LogDebug() << __FUNCTION__ << " (" << this << ")";
+
+	// [MENUDIAG]: CPU writes into the frame would explain text invisible to all draw paths.
+	if (Config.DdrawOrphanOverlayLift && (IsPrimaryOrBackBuffer() || IsRenderTarget()) && !(dwFlags & DDLOCK_READONLY))
+	{
+		LOG_LIMIT(20000, "[MENUDIAG] Lock-write surf=" << this <<
+			(IsPrimarySurface() ? " PRIMARY" : IsBackBuffer() ? " BACKBUFFER" : " RENDERTARGET") <<
+			" rect=" << lpDestRect << " flags=" << Logging::hex(dwFlags));
+
+		// [BLITQUAD] v2: software-rendered content (menu TEXT) lands here -- mark the
+		// frame dirty so EndScene captures the emulated backbuffer as an overlay.
+		if (Config.DdrawMenuBlitOverlay)
+		{
+			MenuBlitOverlayMarkLockDirty(this);
+		}
+	}
 
 	// Game using old DirectX, Convert to LPDDSURFACEDESC2
 	if (Config.Dd7to9)
@@ -2815,6 +4552,23 @@ HRESULT m_IDirectDrawSurfaceX::Lock2(LPRECT lpDestRect, LPDDSURFACEDESC2 lpDDSur
 		" Event = " << hEvent <<
 		" MipMapLevel = " << MipMapLevel <<
 		" Version = " << DirectXVersion;
+
+	// [LOCKW] (2026-06-10): a write-lock on a known Blt-source (staging) surface.
+	// Capture the lock rect + the DKII.exe caller now (the writer's identity);
+	// flushed with the resulting content hash at SetDirtyFlag.
+	if (Config.DdrawRecipeLog && MipMapLevel == 0 && !(dwFlags & DDLOCK_READONLY) &&
+		recipeBltSources.count((void*)this))
+	{
+		auto& pend = lockWPending[(void*)this];
+		if (pend.size() < 16)
+		{
+			LockWPend p;
+			p.eip = FindGameCaller();
+			p.hasRect = (lpDestRect != nullptr);
+			p.rect = lpDestRect ? *lpDestRect : RECT{};
+			pend.push_back(p);
+		}
+	}
 
 	if (Config.Dd7to9)
 	{
@@ -3544,6 +5298,15 @@ HRESULT m_IDirectDrawSurfaceX::Unlock(LPRECT lpRect, DWORD MipMapLevel)
 
 		LASTLOCK& LastLock = LockedLevel[MipMapLevel];
 
+		// [BLITQUAD] v3: the menu TEXT is software-rendered through direct d3d9
+		// backbuffer locks (no emulation mirror, v2 found). Grab the written bits NOW,
+		// while the mapping is still valid, and queue them as an overlay.
+		if (Config.DdrawMenuBlitOverlay && !LastLock.ReadOnly && LastLock.LockedRect.pBits &&
+			(IsPrimaryOrBackBuffer() || IsRenderTarget()))
+		{
+			MenuBlitOverlayCaptureLockedBits(LastLock.LockedRect.pBits, LastLock.LockedRect.Pitch, LastLock.Rect);
+		}
+
 #ifdef ENABLE_PROFILING
 		auto startTime = std::chrono::high_resolution_clock::now();
 #endif
@@ -3650,8 +5413,8 @@ HRESULT m_IDirectDrawSurfaceX::Unlock(LPRECT lpRect, DWORD MipMapLevel)
 		{
 			if (!LastLock.ReadOnly)
 			{
-				// Set dirty flag
-				SetDirtyFlag(LastLock.MipMapLevel);
+				// Set dirty flag (with the specific locked rect for per-rect cache invalidation)
+				SetDirtyFlag(LastLock.MipMapLevel, &LastLock.Rect);
 
 				if (LastLock.MipMapLevel == 0)
 				{
@@ -6557,7 +8320,9 @@ bool m_IDirectDrawSurfaceX::TryGetSubTextureForUV(float u_min, float v_min, floa
 			const UINT atlasW = surface.Width;
 			const UINT atlasH = surface.Height;
 			if (atlasW == 0 || atlasH == 0) return false;
-			HRESULT hr = (*d3d9Device)->CreateTexture(atlasW, atlasH, 1, 0,
+			// Levels=0 -> allocate a FULL mip chain. Far/small torches sample reduced
+			// LODs; with only mip 0 they render as a solid white block under Remix.
+			HRESULT hr = (*d3d9Device)->CreateTexture(atlasW, atlasH, 0, 0,
 				D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &sub, nullptr);
 			if (FAILED(hr) || !sub) return false;
 
@@ -6613,6 +8378,16 @@ bool m_IDirectDrawSurfaceX::TryGetSubTextureForUV(float u_min, float v_min, floa
 				if (FAILED(lh)) { dstLevel->Release(); sub->Release(); return false; }
 			}
 
+			// Generate the canonical's full mip chain from the freshly-loaded mip 0.
+			// Static texture (synthesized once, never updated), so this is safe --
+			// unlike the animated game surfaces the old CopyToDrawTexture filter touched.
+			// Without lower mips, far/small torches (reduced LOD) render as a solid white
+			// block under Remix. Mip-0 bytes are unchanged so the Remix XXH3 hash holds.
+			if (sub->GetLevelCount() > 1)
+			{
+				D3DXFilterTexture(sub, nullptr, 0, D3DX_FILTER_LINEAR);
+			}
+
 			subTextureCache[key] = sub;
 
 			// Path C: this is the FIRST synthesis for (family, region) -- claim
@@ -6654,7 +8429,7 @@ bool m_IDirectDrawSurfaceX::TryGetSubTextureForUV(float u_min, float v_min, floa
 			// stable for the cache lifetime and unique per (atlas, region).
 			if (Config.DdrawContentCapture)
 			{
-				CaptureSurfaceContent(dstLevel, (void*)sub);
+				CaptureSurfaceContent(dstLevel, (void*)sub, /*isCrop=*/true);
 			}
 			dstLevel->Release();
 		}
@@ -6670,7 +8445,1043 @@ bool m_IDirectDrawSurfaceX::TryGetSubTextureForUV(float u_min, float v_min, floa
 	return false;
 }
 
-void m_IDirectDrawSurfaceX::SetDirtyFlag(DWORD MipMapLevel)
+// Dynamic-UI solo page check (map_texture etc.): lets the device draw sites apply
+// the emissive blend override to FULL-page draws, which never enter the crop layer
+// where per-placement classification happens.
+bool m_IDirectDrawSurfaceX::IsNamekeyDynamicUiPage()
+{
+	if (!Config.DdrawNameKey || !surface.Texture) return false;
+	auto it = namekeyRecipeByTex.find(surface.Texture);
+	return it != namekeyRecipeByTex.end() && it->second.dynUiSolo;
+}
+
+// ===== [BLITQUAD] menu-text fix (2026-06-12) =====
+// MENUDIAG proved the front end composites its UI -- ALL the menu text -- via 2D
+// Blts straight onto the backbuffer (2013 backbuffer Blts per menu visit, color-
+// keyed sprite layers at screen coords). The path tracer discards the rasterized
+// frame, so that UI can never appear. We queue a texture copy of every such Blt;
+// the device re-emits them at EndScene as XYZRHW quads through the normal draw
+// path, where the orphan-overlay lift renders them near-depth + additive.
+namespace
+{
+	struct MenuBlitOverlayEntry { IDirect3DTexture9* tex = nullptr; RECT dest = {}; };
+	// v10: PERSISTENT overlay store keyed by dest screen region. One-frame display
+	// caused mouse-move strobing (DK2 repaints regions on demand, not per frame);
+	// entries now persist until the game repaints (upsert) or erases (ColorFill).
+	std::unordered_map<uint64_t, MenuBlitOverlayEntry> g_menuBlitPersist;
+
+	uint64_t MenuBlitDestKey(const RECT& r)
+	{
+		return ((uint64_t)(uint16_t)r.left << 48) | ((uint64_t)(uint16_t)r.top << 32) |
+			((uint64_t)(uint16_t)r.right << 16) | (uint64_t)(uint16_t)r.bottom;
+	}
+	struct MenuBlitTexSlot { IDirect3DTexture9* tex = nullptr; LONG w = 0, h = 0; };
+	std::unordered_map<uint64_t, MenuBlitTexSlot> g_menuBlitTexCache;
+	constexpr size_t kMenuBlitQueueCap = 1024;
+	bool g_menuBlitDrawActive = false;
+	IDirect3DTexture9* g_menuBlitCurrentTex = nullptr;
+	bool g_menuBlitBackbufferDirty = false;
+	m_IDirectDrawSurfaceX* g_menuBlitLockedSurf = nullptr;
+
+	// v11: OUR OWN 2D CANVAS. Full-frame snapshots were atomic -- the game's sub-rect
+	// fill erases either killed the whole entry (flash) or were ignored (stale menus).
+	// The canvas mirrors the game's screen 2D state region-by-region: lock-writes
+	// paint pixels in, ColorFills erase regions, blit dests clear under their entry.
+	// Displayed as ONE persistent quad, always complete.
+	std::vector<DWORD> g_menuCanvas;       // ARGB, screen-size; alpha 0 = empty
+	LONG g_menuCanvasW = 0, g_menuCanvasH = 0;
+	RECT g_menuCanvasDirty = {};
+	bool g_menuCanvasHasDirty = false;
+	IDirect3DTexture9* g_menuCanvasTex = nullptr;
+
+	DWORD NativePixelToARGB(D3DFORMAT fmt, const BYTE* p)
+	{
+		switch (fmt)
+		{
+		case D3DFMT_R5G6B5:
+		{ const DWORD v = *(const WORD*)p; const DWORD r = (v >> 11) & 0x1F, g = (v >> 5) & 0x3F, b = v & 0x1F;
+		  return 0xFF000000 | ((r * 255 / 31) << 16) | ((g * 255 / 63) << 8) | (b * 255 / 31); }
+		case D3DFMT_X1R5G5B5: case D3DFMT_A1R5G5B5:
+		{ const DWORD v = *(const WORD*)p; const DWORD r = (v >> 10) & 0x1F, g = (v >> 5) & 0x1F, b = v & 0x1F;
+		  return 0xFF000000 | ((r * 255 / 31) << 16) | ((g * 255 / 31) << 8) | (b * 255 / 31); }
+		case D3DFMT_A4R4G4B4: case D3DFMT_X4R4G4B4:
+		{ const DWORD v = *(const WORD*)p; const DWORD r = (v >> 8) & 0xF, g = (v >> 4) & 0xF, b = v & 0xF;
+		  return 0xFF000000 | ((r * 17) << 16) | ((g * 17) << 8) | (b * 17); }
+		case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8:
+			return 0xFF000000 | (*(const DWORD*)p & 0xFFFFFF);
+		default:
+			return 0;
+		}
+	}
+
+	void MenuCanvasAddDirty(const RECT& r)
+	{
+		if (!g_menuCanvasHasDirty) { g_menuCanvasDirty = r; g_menuCanvasHasDirty = true; return; }
+		g_menuCanvasDirty.left = min(g_menuCanvasDirty.left, r.left);
+		g_menuCanvasDirty.top = min(g_menuCanvasDirty.top, r.top);
+		g_menuCanvasDirty.right = max(g_menuCanvasDirty.right, r.right);
+		g_menuCanvasDirty.bottom = max(g_menuCanvasDirty.bottom, r.bottom);
+	}
+
+	bool MenuCanvasEnsure(LONG w, LONG h, LPDIRECT3DDEVICE9 dev)
+	{
+		if (w <= 0 || h <= 0) return false;
+		if (g_menuCanvasW != w || g_menuCanvasH != h)
+		{
+			g_menuCanvas.assign((size_t)w * h, 0u);
+			g_menuCanvasW = w; g_menuCanvasH = h;
+			if (g_menuCanvasTex) { g_menuCanvasTex->Release(); g_menuCanvasTex = nullptr; }
+		}
+		if (!g_menuCanvasTex && dev)
+		{
+			if (FAILED(dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_menuCanvasTex, nullptr)))
+			{
+				g_menuCanvasTex = nullptr;
+				return false;
+			}
+			RECT full = { 0, 0, w, h };
+			MenuCanvasAddDirty(full);
+		}
+		return g_menuCanvasTex != nullptr;
+	}
+
+	// Clip r to the canvas; returns false if empty.
+	bool MenuCanvasClip(RECT& r)
+	{
+		r.left = max(0L, r.left); r.top = max(0L, r.top);
+		r.right = min(g_menuCanvasW, r.right); r.bottom = min(g_menuCanvasH, r.bottom);
+		return (r.right > r.left && r.bottom > r.top);
+	}
+
+	// Region erase (game ColorFill or art blitted over): black/zero fill -> alpha 0.
+	void MenuCanvasFill(const RECT& rin, DWORD argb)
+	{
+		if (g_menuCanvas.empty()) return;
+		RECT r = rin;
+		if (!MenuCanvasClip(r)) return;
+		for (LONG y = r.top; y < r.bottom; ++y)
+		{
+			DWORD* row = g_menuCanvas.data() + (size_t)y * g_menuCanvasW;
+			for (LONG x = r.left; x < r.right; ++x) row[x] = argb;
+		}
+		MenuCanvasAddDirty(r);
+	}
+
+	// Expand a native-format color key to the ARGB D3DX wants (key pixels -> alpha 0).
+	D3DCOLOR NativeKeyToARGB(D3DFORMAT fmt, DWORD key)
+	{
+		switch (fmt)
+		{
+		case D3DFMT_R5G6B5:
+		{ DWORD r = (key >> 11) & 0x1F, g = (key >> 5) & 0x3F, b = key & 0x1F;
+		  return 0xFF000000 | ((r * 255 / 31) << 16) | ((g * 255 / 63) << 8) | (b * 255 / 31); }
+		case D3DFMT_X1R5G5B5: case D3DFMT_A1R5G5B5:
+		{ DWORD r = (key >> 10) & 0x1F, g = (key >> 5) & 0x1F, b = key & 0x1F;
+		  return 0xFF000000 | ((r * 255 / 31) << 16) | ((g * 255 / 31) << 8) | (b * 255 / 31); }
+		case D3DFMT_A4R4G4B4: case D3DFMT_X4R4G4B4:
+		{ DWORD r = (key >> 8) & 0xF, g = (key >> 4) & 0xF, b = key & 0xF;
+		  return 0xFF000000 | ((r * 17) << 16) | ((g * 17) << 8) | (b * 17); }
+		case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8:
+			return 0xFF000000 | (key & 0xFFFFFF);
+		default:
+			return 0;
+		}
+	}
+}
+
+// Lock-site hook (defined here so the anonymous-namespace globals are in scope at
+// the call through this function regardless of where Lock sits in the file).
+void MenuBlitOverlayMarkLockDirty(m_IDirectDrawSurfaceX* pSurf)
+{
+	g_menuBlitBackbufferDirty = true;
+	g_menuBlitLockedSurf = pSurf;
+}
+
+// [BLITQUAD] v10.3: drop persistent entries that INTERSECT a newly written region --
+// newer screen content supersedes. (Without this, cursor-area repaints at slightly
+// shifted rects accumulated as a golden cursor TRAIL.)
+void MenuBlitOverlayEraseIntersecting(const RECT& r)
+{
+	for (auto it = g_menuBlitPersist.begin(); it != g_menuBlitPersist.end(); )
+	{
+		const RECT& d = it->second.dest;
+		const bool intersects = !(d.right <= r.left || d.left >= r.right ||
+			d.bottom <= r.top || d.top >= r.bottom);
+		if (intersects) it = g_menuBlitPersist.erase(it);
+		else ++it;
+	}
+}
+
+// [BLITQUAD] v11: a fill on EITHER screen surface is the game erasing that region
+// of its 2D layer -- mirror it into the canvas exactly. (The atomic-snapshot dilemma
+// of v10.x -- "erase kills everything" vs "erase ignores everything" -- is gone:
+// the canvas is region-accurate by construction.)
+void MenuBlitOverlayEraseRegion(LPRECT lpRect, LONG surfW, LONG surfH)
+{
+	if (g_menuCanvas.empty()) return;
+	RECT r = {};
+	if (lpRect) r = *lpRect;
+	else { r.right = surfW; r.bottom = surfH; }
+	MenuCanvasFill(r, 0u);
+}
+
+bool MenuBlitOverlayDrawActive() { return g_menuBlitDrawActive; }
+
+// The device draw path rebinds textures from the game's CurrentTexture state on
+// EVERY draw (SetDrawStates texture loop), which stomps any direct d3d9 SetTexture.
+// The drain publishes its per-quad texture here; the draw sites bind it AFTER
+// SetDrawStates -- the same after-the-rebind slot the atlas-decompose bind uses.
+IDirect3DTexture9* MenuBlitOverlayCurrentTex() { return g_menuBlitDrawActive ? g_menuBlitCurrentTex : nullptr; }
+
+void m_IDirectDrawSurfaceX::MenuBlitOverlayQueue(m_IDirectDrawSurfaceX* pSrc, LPRECT lpSrcRect, LPRECT lpDestRect, bool hasSrcKey, DWORD nativeSrcKey)
+{
+	if (!pSrc || !d3d9Device || !*d3d9Device) return;
+	if (!MenuCanvasEnsure((LONG)surface.Width, (LONG)surface.Height, *d3d9Device)) return;
+
+	RECT sr = {};
+	if (lpSrcRect) sr = *lpSrcRect;
+	else { sr.right = (LONG)pSrc->surface.Width; sr.bottom = (LONG)pSrc->surface.Height; }
+	RECT dr = {};
+	if (lpDestRect) dr = *lpDestRect;
+	else { dr.right = (LONG)surface.Width; dr.bottom = (LONG)surface.Height; }
+	const LONG dw = dr.right - dr.left, dh = dr.bottom - dr.top;
+	if (dw <= 0 || dh <= 0 || sr.right <= sr.left || sr.bottom <= sr.top) return;
+
+	IDirect3DSurface9* srcD9 = nullptr;
+	bool releaseSrc = false;
+	if (pSrc->surface.Texture)
+	{
+		if (FAILED(pSrc->surface.Texture->GetSurfaceLevel(0, &srcD9)) || !srcD9) return;
+		releaseSrc = true;
+	}
+	else if (pSrc->surface.Surface)
+	{
+		srcD9 = pSrc->surface.Surface;
+	}
+	if (!srcD9)
+	{
+		LOG_LIMIT(100, "[BLITQUAD] skip: src " << pSrc << " has no d3d9 object (emulated-only)");
+		return;
+	}
+
+	// v11: composite the blit into OUR canvas (CPU pixels via a reusable sysmem
+	// staging surface; D3DX handles stretch + color-key->alpha). Keyed pixels leave
+	// the canvas untouched; opaque pixels overwrite (black = erase under additive).
+	static IDirect3DSurface9* stage = nullptr;
+	static LONG stageW = 0, stageH = 0;
+	if (stage && (stageW < dw || stageH < dh)) { stage->Release(); stage = nullptr; }
+	if (!stage)
+	{
+		const LONG nw = max(dw, stageW), nh = max(dh, stageH);
+		if (FAILED((*d3d9Device)->CreateOffscreenPlainSurface(nw, nh, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &stage, nullptr)) || !stage)
+		{
+			stage = nullptr;
+			if (releaseSrc) srcD9->Release();
+			return;
+		}
+		stageW = nw; stageH = nh;
+	}
+	RECT str = { 0, 0, dw, dh };
+	const D3DCOLOR ck = hasSrcKey ? NativeKeyToARGB(pSrc->surface.Format, nativeSrcKey) : 0;
+	HRESULT lh = D3DXLoadSurfaceFromSurface(stage, nullptr, &str, srcD9, nullptr, &sr, D3DX_FILTER_POINT, ck);
+	if (releaseSrc) srcD9->Release();
+	if (FAILED(lh))
+	{
+		LOG_LIMIT(100, "[BLITQUAD] stage load failed src=" << pSrc);
+		return;
+	}
+
+	D3DLOCKED_RECT lrk;
+	if (FAILED(stage->LockRect(&lrk, &str, D3DLOCK_READONLY))) return;
+	RECT cd = dr;
+	if (MenuCanvasClip(cd))
+	{
+		for (LONG y = cd.top; y < cd.bottom; ++y)
+		{
+			const DWORD* srow = (const DWORD*)((const BYTE*)lrk.pBits + (size_t)(y - dr.top) * lrk.Pitch);
+			DWORD* drow = g_menuCanvas.data() + (size_t)y * g_menuCanvasW;
+			for (LONG x = cd.left; x < cd.right; ++x)
+			{
+				const DWORD px = srow[x - dr.left];
+				// Non-black pixels composite; BLACK NEVER ERASES via blits. The game's
+				// cursor save/restore round-trips through the d3d9 backbuffer, which
+				// under Remix does NOT retain the CPU composite -- the "saved" content
+				// reads back black, and restoring it was wiping canvas text wherever
+				// the cursor passed (permanently). Only explicit ColorFills erase.
+				if ((px & 0xFF000000) && (px & 0xFFFFFF)) drow[x] = px;
+			}
+		}
+		MenuCanvasAddDirty(cd);
+	}
+	stage->UnlockRect();
+}
+
+// [BLITQUAD] v3: capture written lock bits while the d3d9 mapping is valid (called
+// from Unlock). One queued quad per (surface, rect) per frame -- repeated unlocks of
+// the same region would stack additively and over-brighten.
+void m_IDirectDrawSurfaceX::MenuBlitOverlayCaptureLockedBits(void* pBits, INT pitch, const RECT& lockedRect)
+{
+	if (!d3d9Device || !*d3d9Device || !pBits) return;
+
+	// v11: write the locked region into OUR canvas -- region-accurate semantics
+	// replace the atomic full-frame snapshots that caused both the flash (erase
+	// kills everything) and the stale-menu overlap (erase ignores everything).
+	if (!MenuCanvasEnsure((LONG)surface.Width, (LONG)surface.Height, *d3d9Device)) return;
+	RECT r = lockedRect;
+	if (!MenuCanvasClip(r)) return;
+	const UINT bpp = (surface.Format == D3DFMT_X8R8G8B8 || surface.Format == D3DFMT_A8R8G8B8) ? 4 : 2;
+	for (LONG y = r.top; y < r.bottom; ++y)
+	{
+		// pBits addresses the LOCKED rect's origin
+		const BYTE* srcRow = (const BYTE*)pBits + (size_t)(y - lockedRect.top) * pitch;
+		DWORD* dstRow = g_menuCanvas.data() + (size_t)y * g_menuCanvasW;
+		for (LONG x = r.left; x < r.right; ++x)
+		{
+			const DWORD argb = NativePixelToARGB(surface.Format, srcRow + (size_t)(x - lockedRect.left) * bpp);
+			// BLACK NEVER ERASES here either: the d3d9 lock mapping does not retain
+			// the previous composite under Remix, so unwritten regions of a full-
+			// surface lock read back black -- writing that would erase every other
+			// region's text. Erasure is exclusively the game's explicit ColorFills.
+			if (argb & 0xFFFFFF) dstRow[x] = argb;
+		}
+	}
+	MenuCanvasAddDirty(r);
+	LOG_LIMIT(2000, "[BLITQUAD] canvas write " << (r.right - r.left) << "x" << (r.bottom - r.top) << " at {" << r.left << "," << r.top << "}");
+}
+
+// [BLITQUAD] v2 (superseded by v3 unlock-time capture; the backbuffer turned out not
+// to be emulated, so there is no sysmem mirror to read). Kept as a stub so the header
+// declaration stays valid.
+void m_IDirectDrawSurfaceX::MenuBlitOverlayCaptureLockedFrame()
+{
+}
+
+// Drain at EndScene: draw each queued overlay as a screen-space quad through the
+// device's normal draw path. g_menuBlitDrawActive makes the orphan-overlay lift
+// accept these draws (near depth + additive) regardless of bound wrapper texture.
+void MenuBlitOverlayDrain(m_IDirect3DDeviceX* pDevice, LPDIRECT3DDEVICE9 dev)
+{
+	// v11: ONE canvas quad. Upload the dirty region, then draw the always-complete
+	// 2D layer through the device's own draw path (lift -> near depth + additive).
+	g_menuBlitBackbufferDirty = false;
+
+	if (!g_menuCanvasTex || !pDevice || !dev) return;
+
+	if (g_menuCanvasHasDirty && !g_menuCanvas.empty())
+	{
+		RECT d = g_menuCanvasDirty;
+		if (MenuCanvasClip(d))
+		{
+			D3DLOCKED_RECT lr;
+			if (SUCCEEDED(g_menuCanvasTex->LockRect(0, &lr, &d, 0)))
+			{
+				for (LONG y = d.top; y < d.bottom; ++y)
+				{
+					memcpy((BYTE*)lr.pBits + (size_t)(y - d.top) * lr.Pitch,
+						g_menuCanvas.data() + (size_t)y * g_menuCanvasW + d.left,
+						(size_t)(d.right - d.left) * 4);
+				}
+				g_menuCanvasTex->UnlockRect(0);
+			}
+		}
+		g_menuCanvasHasDirty = false;
+	}
+
+	g_menuBlitDrawActive = true;
+	// Published for the device draw site to bind AFTER its texture-rebind loop
+	// (a direct SetTexture here would be stomped by SetDrawStates).
+	g_menuBlitCurrentTex = g_menuCanvasTex;
+	struct V { float x, y, z, rhw, u, v; };
+	const float r = (float)g_menuCanvasW, b = (float)g_menuCanvasH;
+	V quad[4] =
+	{
+		{ 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f },
+		{ r,    0.0f, 0.0f, 1.0f, 1.0f, 0.0f },
+		{ 0.0f, b,    0.0f, 1.0f, 0.0f, 1.0f },
+		{ r,    b,    0.0f, 1.0f, 1.0f, 1.0f },
+	};
+	pDevice->DrawPrimitive(D3DPT_TRIANGLESTRIP, D3DFVF_XYZRHW | D3DFVF_TEX1, quad, 4, 0, 7);
+	g_menuBlitDrawActive = false;
+	g_menuBlitCurrentTex = nullptr;
+	// No texture restore needed: the next real draw's SetDrawStates rebinds the
+	// game's CurrentTexture state (the same loop that made the restore necessary).
+
+	LOG_LIMIT(2000, "[BLITQUAD] canvas quad drawn " << g_menuCanvasW << "x" << g_menuCanvasH);
+}
+
+// Orphan-overlay lift classification (2026-06-12, menu-text fix): a page with NO
+// recipe never received content from the tracked EngineTextures upload blit -- its
+// pixels were runtime-rendered (MyTextRenderer glyph composites = menu text,
+// loading-screen elements). See the device draw sites for how this is used.
+bool m_IDirectDrawSurfaceX::IsNamekeyOrphanPage()
+{
+	if (!Config.DdrawNameKey || !surface.Texture) return false;
+	return namekeyRecipeByTex.find(surface.Texture) == namekeyRecipeByTex.end();
+}
+
+// [LIFT] diagnostics: brief recipe description for the device-site telemetry.
+void m_IDirectDrawSurfaceX::GetNamekeyRecipeBrief(char* buf, size_t bufSize)
+{
+	if (!buf || bufSize == 0) return;
+	buf[0] = '\0';
+	if (!Config.DdrawNameKey || !surface.Texture) { strcpy_s(buf, bufSize, "notex"); return; }
+	auto it = namekeyRecipeByTex.find(surface.Texture);
+	if (it == namekeyRecipeByTex.end()) { strcpy_s(buf, bufSize, "none"); return; }
+	char names[192]; names[0] = '\0';
+	uint32_t seen[3] = { 0, 0, 0 };
+	int distinct = 0;
+	for (const NamekeyPlacement& q : it->second.comps)
+	{
+		bool dup = false;
+		for (int i = 0; i < distinct && i < 3; ++i) { if (seen[i] == q.idx) { dup = true; break; } }
+		if (dup) continue;
+		if (distinct < 3)
+		{
+			seen[distinct] = q.idx;
+			const char* nm = NamekeyNameForIdx(q.idx);
+			if (distinct) strcat_s(names, sizeof(names), "+");
+			strcat_s(names, sizeof(names), nm ? nm : "?");
+		}
+		++distinct;
+	}
+	sprintf_s(buf, bufSize, "%s(distinct=%d,placements=%u)", names, distinct, (unsigned)it->second.comps.size());
+}
+
+// Gate-free water classification (2026-06-11): large water bodies are 34-340 vert
+// meshes (run-11 DRAW_XYZRHW measurement) whose UV bbox sits exactly inside ONE
+// Water placement -- they fail the universal-decompose caller gates (vcount<=32,
+// UV area<0.5), so the crop layer's placement classification never saw them and
+// the flatten missed every large body while puddles stood still. This is the
+// classification ALONE: recipe lookup + snapped-texel containment, read-only --
+// no crop, no UV rewrite (the 115-vert Remix AV history applies to REWRITING big
+// meshes, not to reading them). Full-page draws on co-atlased pages span multiple
+// placements -> not contained -> correctly excluded (flattening those would
+// flatten torch billboards sharing the page).
+bool m_IDirectDrawSurfaceX::IsNamekeyWaterDraw(float u_min, float v_min, float u_max, float v_max)
+{
+	if (!Config.DdrawNameKey || !surface.Texture) return false;
+	auto it = namekeyRecipeByTex.find(surface.Texture);
+	if (it == namekeyRecipeByTex.end() || !it->second.hasWater) return false;
+	const UINT atlasW = surface.Width;
+	const UINT atlasH = surface.Height;
+	if (atlasW == 0 || atlasH == 0) return false;
+	// Same texel snapping as the crop layer; deliberately NOT clamped to the page:
+	// a tiling/wrapping bbox must fail containment rather than be clamped into it.
+	const long px0 = (long)floorf(u_min * atlasW);
+	const long py0 = (long)floorf(v_min * atlasH);
+	const long px1 = (long)ceilf(u_max * atlasW);
+	const long py1 = (long)ceilf(v_max * atlasH);
+	for (const NamekeyPlacement& q : it->second.comps)
+	{
+		if (!q.isWater) continue;
+		// Containment with 1-texel slack, mirroring the crop layer's placement match.
+		if (px0 >= (long)q.a2 - 1 && py0 >= (long)q.a3 - 1 &&
+			px1 <= (long)(q.a2 + q.sw) + 1 && py1 <= (long)(q.a3 + q.sh) + 1)
+		{
+			namekeyWaterLarge++;
+			return true;
+		}
+	}
+	return false;
+}
+
+// Universal UV-region decomposition (2026-05-21). See the cache declarations + the
+// dk2_universal_decompose_plan memory for the design. Crops the drawcall's exact
+// sampled texel rect into a content-hash-keyed sub-texture and returns the [0,1]
+// transform. No fingerprints, no hardcoded hashes, no source PNGs.
+bool m_IDirectDrawSurfaceX::TryGetUniversalSubTextureForUV(float u_min, float v_min, float u_max, float v_max,
+	IDirect3DTexture9*& subTexOut,
+	float& regionU0Out, float& regionV0Out,
+	float& regionDuOut, float& regionDvOut,
+	int& regionIdxOut)
+{
+	subTexOut = nullptr; regionIdxOut = -1;
+	if (!Config.DdrawUniversalDecompose) return false;
+	if (!IsSurfaceTexture() || !surface.Texture) return false;
+	if (!d3d9Device || !*d3d9Device) return false;
+	// Streaming-buffer guard (Phase 4, 2026-05-24): if this surface has been classified
+	// as a streaming buffer (high crop rate, mostly-unique rects = engine constantly
+	// writing new content into it), bail immediately. The caller falls back to using the
+	// whole surface texture. This prevents the camera-pan-in-dense-scene perf cliff where
+	// one streaming surface generates ~200 unique rects/sec and floods Remix with churn.
+	if (surface.UnivSkipDecompose) { stage3PerSurface[(void*)this].blacklistSkips++; return false; }
+
+	const UINT atlasW = surface.Width;
+	const UINT atlasH = surface.Height;
+	if (atlasW == 0 || atlasH == 0) return false;
+
+	// Snap the UV bbox to integer texel boundaries: floor the min, ceil the max so
+	// the cropped rect fully covers the sampled region. The snapped rect (in UV
+	// space) is the transform we hand back for the downstream [0,1] UV rewrite.
+	long px0 = (long)floorf(u_min * atlasW);
+	long py0 = (long)floorf(v_min * atlasH);
+	long px1 = (long)ceilf(u_max * atlasW);
+	long py1 = (long)ceilf(v_max * atlasH);
+	if (px0 < 0) px0 = 0;
+	if (py0 < 0) py0 = 0;
+	if (px1 > (long)atlasW) px1 = (long)atlasW;
+	if (py1 > (long)atlasH) py1 = (long)atlasH;
+	const long rw = px1 - px0;
+	const long rh = py1 - py0;
+	if (rw <= 0 || rh <= 0) return false;
+	// If snapping pushed the rect to the whole texture, this isn't a proper sub-rect.
+	if ((UINT)rw >= atlasW && (UINT)rh >= atlasH) return false;
+
+	const float su0 = (float)px0 / (float)atlasW;
+	const float sv0 = (float)py0 / (float)atlasH;
+	const float su1 = (float)px1 / (float)atlasW;
+	const float sv1 = (float)py1 / (float)atlasH;
+
+	// (1) Per-(wrapper, quantized rect) fast path -- O(1), no crop/hash.
+	// Gen-mismatch gate (Phase 5, 2026-05-24): RepurposeGen on the surface is bumped
+	// by SetDirtyFlag ONLY when a Blt follows a long idle gap (sprite-repurpose
+	// signature). Animations Blt continuously (small gaps) -> gen never bumps -> cache
+	// stays valid -> torch-flicker fix preserved. Repurposes (idle then Blt) -> gen
+	// bumps -> entries cached under old gen invalidate on this bind -> fresh crop from
+	// current content. Replaces the cruder Phase 2/3 time-since-cache check, which fired
+	// spuriously on long-running animations and missed fast-cadence repurposes.
+	UnivDrawKey dkey{ (void*)this, QuantizeUV(su0), QuantizeUV(sv0), QuantizeUV(su1), QuantizeUV(sv1) };
+	auto dIt = univDrawCache.find(dkey);
+	if (dIt != univDrawCache.end())
+	{
+		bool isStale = (dIt->second.cachedAtRepurposeGen != surface.RepurposeGen);
+		// Phase 7 (2026-05-24): per-Blt rect overlap gate. Even if RepurposeGen matches
+		// (surface hasn't been idle-then-Blt'd), check whether any Blt since this entry
+		// was cached touched the pixel rect this entry covers. If so, the cached pixels
+		// no longer match what the source surface holds at that rect -> invalidate. This
+		// catches the "continuously-Blt'd shared atlas" case where the per-surface gate
+		// can't fire (no idle gap) but per-rect content has changed.
+		if (!isStale)
+		{
+			const UnivSubTex& e = dIt->second;
+			for (int i = 0; i < kBltHistorySize; ++i)
+			{
+				const auto& h = BltHistory[i];
+				if (h.timeMs > e.cachedAtTimeMs)
+				{
+					// Standard 2D AABB intersection test
+					if (h.x0 < e.px1 && h.x1 > e.px0 && h.y0 < e.py1 && h.y1 > e.py0)
+					{
+						isStale = true;
+						break;
+					}
+				}
+			}
+		}
+		if (isStale)
+		{
+			univLru.erase(dIt->second.lruIt);
+			if (dIt->second.tex) dIt->second.tex->Release();
+			univDrawCache.erase(dIt);
+			univInvalidatesTotal++;
+			stage3PerSurface[(void*)this].invals++;
+			// fall through to miss path
+		}
+		else
+		{
+			// Touch: move to MRU end so frequently-drawn crops (torches) never get
+			// evicted while transient map crops age toward the front. Skip splice if
+			// already at MRU end -- saves redundant list-pointer writes per frame.
+			if (dIt->second.lruIt != std::prev(univLru.end()))
+				univLru.splice(univLru.end(), univLru, dIt->second.lruIt);
+			subTexOut = dIt->second.tex;
+			regionU0Out = dIt->second.u0;
+			regionV0Out = dIt->second.v0;
+			regionDuOut = dIt->second.u1 - dIt->second.u0;
+			regionDvOut = dIt->second.v1 - dIt->second.v0;
+			regionIdxOut = 0;
+			if (subTexOut) { univDecomposeBindsTotal++; stage3PerSurface[(void*)this].hits++; }
+			return subTexOut != nullptr;
+		}
+	}
+
+	// [NAMEKEY] V2 (2026-06-11): placement-keyed crop resolution. If this page carries a
+	// composition recipe (attached by the staging Blt from the 0x58E53B detour's
+	// placements) and the draw's snapped texel rect sits inside exactly ONE placement,
+	// the draw is sampling THAT sprite: resolve the sub-texture by (nameIdx, mip)
+	// instead of by content. The bound crop is built FROM the canonical sidecar payload
+	// (mip-0 verbatim -> its Remix hash == XXH3(payload), offline-known for all 5767
+	// entries), and the live page rect is nibble-verified against that payload on EVERY
+	// cache insert -- a failed verify falls through to the content-correct legacy crop,
+	// so neither recipe mis-attribution nor stale recipes can bind wrong art.
+	// Serving an already-built crop is a map lookup + small CPU verify (no synthesis),
+	// so it sits BEFORE the scarcity gate: during effect bursts, sprites with built
+	// crops keep their per-frame replacements. First-time synthesis stays gated below.
+	auto NkServeCrop = [&](IDirect3DTexture9* ctex, long cx, long cy, long cw, long ch) -> bool
+	{
+		ctex->AddRef();	// the univDrawCache entry's reference; invalidate/evict Release() it
+		const float pu0 = (float)cx / (float)atlasW;
+		const float pv0 = (float)cy / (float)atlasH;
+		const float pu1 = (float)(cx + cw) / (float)atlasW;
+		const float pv1 = (float)(cy + ch) / (float)atlasH;
+		univLru.push_back(dkey);
+		auto nkLruIt = std::prev(univLru.end());
+		univDrawCache[dkey] = UnivSubTex{ ctex, pu0, pv0, pu1, pv1, nkLruIt, surface.RepurposeGen,
+			(LONG)cx, (LONG)cy, (LONG)(cx + cw), (LONG)(cy + ch), GetTickCount() };
+		while (univDrawCache.size() > kUnivCacheCap && !univLru.empty())
+		{
+			const UnivDrawKey oldKey = univLru.front();
+			univLru.pop_front();
+			auto oIt = univDrawCache.find(oldKey);
+			if (oIt != univDrawCache.end())
+			{
+				if (oIt->second.tex) oIt->second.tex->Release();
+				univDrawCache.erase(oIt);
+				univEvictTotal++;
+			}
+		}
+		namekeyCropServe++;
+		subTexOut = ctex;
+		regionU0Out = pu0; regionV0Out = pv0;
+		regionDuOut = pu1 - pu0; regionDvOut = pv1 - pv0;
+		regionIdxOut = 0;
+		univDecomposeBindsTotal++;
+		return true;
+	};
+	const NamekeyPlacement* nkPlace = nullptr;
+	if (Config.DdrawNameKey && Config.DdrawNameKeyCrop)
+	{
+		EnsureCanonSidecarsLoaded();	// no-op once loaded; binds normally run first, but don't depend on it
+		auto nrIt = namekeyRecipeByTex.find(surface.Texture);
+		if (nrIt != namekeyRecipeByTex.end() && !nrIt->second.comps.empty())
+		{
+			int contain = 0;
+			for (const NamekeyPlacement& q : nrIt->second.comps)
+			{
+				// Containment with 1-texel slack (floor/ceil snapping vs the game's
+				// half-texel-inset sampling); placements never overlap in a bin-pack,
+				// so >1 containment means boundary ambiguity or a mixed accumulator.
+				if (px0 >= (long)q.a2 - 1 && py0 >= (long)q.a3 - 1 &&
+					px1 <= (long)(q.a2 + q.sw) + 1 && py1 <= (long)(q.a3 + q.sh) + 1)
+				{
+					contain++;
+					nkPlace = &q;
+				}
+			}
+			if (contain == 0) { namekeyCropSubmiss++; nkPlace = nullptr; }
+			else if (contain > 1) { namekeyCropAmbiguous++; nkPlace = nullptr; }
+			else
+			{
+				namekeyCropMatch++;
+				const uint64_t ck = ((uint64_t)nkPlace->idx << 3) | (uint64_t)(nkPlace->mip & 7);
+				auto sIt = namekeyCropByKey.find(ck);
+				if (sIt != namekeyCropByKey.end())
+				{
+					NamekeyCropState& st = sIt->second;
+					if (st.dynUi)
+					{
+						g_namekeyDrawDynUiAny = true;
+						if (!st.isPointer) g_namekeyDrawDynUi = true;	// pointer renders via rtx.uiTextures, not additive
+					}
+					if (st.isWater) g_namekeyDrawWater = true;	// device flattens this draw's world heights
+					if (st.st == 1 && st.tex && Config.DdrawNameKeyCrop >= 2)
+					{
+						float bf = 1.0f;
+						if (NamekeyCropVerifyRect(surface.Texture, nkPlace->a2, nkPlace->a3, st.payload, st.w, st.h, &bf) == 0)
+						{
+							return NkServeCrop(st.tex, nkPlace->a2, nkPlace->a3, st.w, st.h);
+						}
+						// Stale/foreign content at the rect this draw: per-draw failure
+						// only (state untouched); the legacy crop below is content-correct.
+						namekeyCropServeVerifyFail++;
+						nkPlace = nullptr;
+					}
+					else
+					{
+						nkPlace = nullptr;	// FAILED (-1) / shadow-logged (2): no re-attempt
+					}
+				}
+				// else: first sight of this (name, mip) -- synthesis attempt below,
+				// behind the scarcity gate (sidecar read + texture create is real work).
+			}
+		}
+	}
+
+	// Global rate scarcity gate (Phase 8): we're about to synthesize (cache miss or
+	// just-invalidated entry). If the engine is gushing one-shot tiny crops faster
+	// than we can absorb them (steam-on-water etc.), refuse new work for the rest of
+	// this burst. Cache HITS above this point are unaffected -- already-cached torches
+	// keep their replacements. New unique (atlas, rect) keys fall back to whole-surface
+	// (caller-side null handling), which Remix replaces from its whole-surface mod
+	// entries instead of POT crops. Window=1s, enter=200/s, exit=100/s (hysteresis).
+	{
+		const DWORD nowMsGate = GetTickCount();
+		if (g_globalRateWindowStartMs == 0) g_globalRateWindowStartMs = nowMsGate;
+		if (nowMsGate - g_globalRateWindowStartMs >= 1000)
+		{
+			const DWORD lastWindowRate = g_globalRateCropsInWindow;
+			if (!g_globalScarcityMode && lastWindowRate >= kGlobalRateScarcityEnterPerSec)
+			{
+				g_globalScarcityMode = true;
+				univScarcityEntersTotal++;
+				char sbuf[220];
+				sprintf_s(sbuf, sizeof(sbuf), "[UNIV] SCARCITY ENTER rate=%lu/s (enter>=%lu/s) -- new crops suspended until rate<%lu/s",
+					(unsigned long)lastWindowRate, (unsigned long)kGlobalRateScarcityEnterPerSec, (unsigned long)kGlobalRateScarcityExitPerSec);
+				Logging::Log() << sbuf;
+			}
+			else if (g_globalScarcityMode && lastWindowRate < kGlobalRateScarcityExitPerSec)
+			{
+				g_globalScarcityMode = false;
+				char sbuf[220];
+				sprintf_s(sbuf, sizeof(sbuf), "[UNIV] SCARCITY EXIT rate=%lu/s (exit<%lu/s) -- new crops resumed (skipped total=%lu, enters total=%lu)",
+					(unsigned long)lastWindowRate, (unsigned long)kGlobalRateScarcityExitPerSec, (unsigned long)univScarcitySkippedTotal, (unsigned long)univScarcityEntersTotal);
+				Logging::Log() << sbuf;
+			}
+			g_globalRateWindowStartMs = nowMsGate;
+			g_globalRateCropsInWindow = 0;
+		}
+		if (g_globalScarcityMode)
+		{
+			univScarcitySkippedTotal++;
+			stage3PerSurface[(void*)this].scarcitySkips++;
+			return false;
+		}
+	}
+
+	// [NAMEKEY] V2 first sight of (name, mip): resolve the sidecar payload, verify the
+	// live rect against it, and (mode 2) build the canonical crop FROM the payload.
+	// Shadow mode (1) logs the verdict and binds nothing. Any failure marks the key
+	// (permanently for sidecar/dims/create failures) and falls through to the legacy
+	// content crop below -- v2 is purely additive coverage.
+	if (nkPlace)
+	{
+		const uint64_t ck = ((uint64_t)nkPlace->idx << 3) | (uint64_t)(nkPlace->mip & 7);
+		NamekeyCropState st;
+		st.st = -1;
+		const char* nm = NamekeyNameForIdx(nkPlace->idx);
+		char ckey[128] = {};
+		if (nm)
+		{
+			sprintf_s(ckey, sizeof(ckey), "%sMM%u", nm, (unsigned)(nkPlace->mip & 7));
+			for (char* c = ckey; *c; ++c) *c = (char)tolower((unsigned char)*c);
+		}
+		// Runtime-rendered UI names (pointer strips, tooltips, map) have no sidecar by
+		// nature -- classify them for the emissive draw-state override before the
+		// lookup fails, and remember it in the state so later draws classify O(1).
+		if (nm && NamekeyNameIsDynamicUi(ckey))
+		{
+			st.dynUi = true;
+			st.isPointer = NamekeyNameIsPointer(ckey);
+			g_namekeyDrawDynUiAny = true;
+			if (!st.isPointer) g_namekeyDrawDynUi = true;
+		}
+		if (nm && NamekeyNameIsWater(ckey))
+		{
+			st.isWater = true;
+			g_namekeyDrawWater = true;
+		}
+		auto ixIt = nm ? namekeyCropIdx.find((uint64_t)XXH3_64bits(ckey, strlen(ckey))) : namekeyCropIdx.end();
+		if (!nm || ixIt == namekeyCropIdx.end())
+		{
+			// Procedural/unnamed content (map_texture etc.) has no extracted source --
+			// correctly excluded; the legacy content crop handles it.
+			namekeyCropNoSidecar++;
+		}
+		else if ((long)ixIt->second.w != (long)nkPlace->sw || (long)ixIt->second.h != (long)nkPlace->sh)
+		{
+			// Extracted dims must equal the descriptor's source dims -- doubling as a
+			// cheap attribution guard before any pixel work.
+			namekeyCropDimsMismatch++;
+		}
+		else if (!NamekeyCropReadPayload(ixIt->second, st.payload))
+		{
+			namekeyCropReadFail++;
+		}
+		else
+		{
+			st.w = ixIt->second.w;
+			st.h = ixIt->second.h;
+			float bf = 1.0f;
+			const int vr = NamekeyCropVerifyRect(surface.Texture, nkPlace->a2, nkPlace->a3, st.payload, st.w, st.h, &bf);
+			if (Config.DdrawNameKeyCrop == 1)
+			{
+				// Shadow: verdict logged once per (name, mip); nothing created or bound.
+				st.st = 2;
+				if (vr == 0) namekeyCropShadowPass++; else namekeyCropShadowFail++;
+				if (namekeyCropShadowLogged < 200)
+				{
+					namekeyCropShadowLogged++;
+					char buf[300];
+					sprintf_s(buf, sizeof(buf), "[NAMEKEY] CROPSHADOW key=\"%s\" at=%ld,%ld %ux%u page=%ux%u draw=[%ld,%ld,%ld,%ld] vr=%d bigfrac=%.4f duv=%.4f,%.4f,%.4f,%.4f",
+						ckey, (long)nkPlace->a2, (long)nkPlace->a3, (unsigned)st.w, (unsigned)st.h,
+						atlasW, atlasH, px0, py0, px1, py1, vr, bf,
+						nkPlace->u0, nkPlace->v0, nkPlace->u1, nkPlace->v1);
+					Logging::Log() << buf;
+				}
+				st.payload.clear();
+				st.payload.shrink_to_fit();	// shadow keeps no payload resident
+			}
+			else if (vr != 0)
+			{
+				if (vr == 2) namekeyCropBadFormat++; else namekeyCropVerifyFail++;
+				if (namekeyCropLogged < 200)
+				{
+					namekeyCropLogged++;
+					char buf[260];
+					sprintf_s(buf, sizeof(buf), "[NAMEKEY] CROPVERIFYFAIL key=\"%s\" at=%ld,%ld %ux%u vr=%d bigfrac=%.4f",
+						ckey, (long)nkPlace->a2, (long)nkPlace->a3, (unsigned)st.w, (unsigned)st.h, vr, bf);
+					Logging::Log() << buf;
+				}
+			}
+			else
+			{
+				// SERVE-KEY COLLAPSE (2026-06-11). Two collapses, same mechanism, both
+				// "verify own payload (attribution truth), serve canonical payload":
+				// - MM0-collapse: any mip placement serves the sprite's MM0 content;
+				//   Remix sees ONE hash per sprite across all game-side mip pages and
+				//   the hi-res replacement's own mip chain handles distance.
+				// - WATER FRAME-collapse (DdrawWaterCollapse): WaterN/WaterSOLIDN all
+				//   serve frame 0 -- the surface stops cycling, Remix's denoiser gets
+				//   ONE stable material (reflections converge instead of resetting 32x
+				//   per cycle), and a single translucent mod entry covers every frame.
+				//   The water MESH still moves if the game animates it; only the
+				//   texture stills. waterfoot etc. don't match (digit required).
+				// UV transforms are placement-rect-based = resolution-independent.
+				const std::vector<uint8_t>* servePayload = &st.payload;
+				uint32_t serveW = st.w, serveH = st.h;
+				std::vector<uint8_t> collapsedPayload;
+				char serveKey[128];
+				strcpy_s(serveKey, sizeof(serveKey), ckey);
+				bool waterFam = false;
+				if (Config.DdrawWaterCollapse)
+				{
+					if (!strncmp(ckey, "watersolid", 10) && isdigit((unsigned char)ckey[10]))
+					{
+						strcpy_s(serveKey, sizeof(serveKey), "watersolid0mm0");
+						waterFam = true;
+					}
+					else if (!strncmp(ckey, "water", 5) && isdigit((unsigned char)ckey[5]))
+					{
+						strcpy_s(serveKey, sizeof(serveKey), "water0mm0");
+						waterFam = true;
+					}
+				}
+				if (!waterFam && (nkPlace->mip & 7) != 0)
+				{
+					sprintf_s(serveKey, sizeof(serveKey), "%sMM0", nm);
+					for (char* c = serveKey; *c; ++c) *c = (char)tolower((unsigned char)*c);
+				}
+				if (strcmp(serveKey, ckey) != 0)
+				{
+					auto ix0 = namekeyCropIdx.find((uint64_t)XXH3_64bits(serveKey, strlen(serveKey)));
+					if (ix0 != namekeyCropIdx.end() && NamekeyCropReadPayload(ix0->second, collapsedPayload))
+					{
+						servePayload = &collapsedPayload;
+						serveW = ix0->second.w;
+						serveH = ix0->second.h;
+						if (waterFam) namekeyWaterCollapse++; else namekeyCropMm0Collapse++;
+					}
+				}
+				const uint64_t ph = (uint64_t)XXH3_64bits(servePayload->data(), servePayload->size());
+				IDirect3DTexture9* ctex = NamekeyCropGetOrCreateTex(ph, *servePayload, serveW, serveH, d3d9Device);
+				if (ctex)
+				{
+					st.st = 1;
+					st.tex = ctex;
+					namekeyCropSynth++;
+					g_globalRateCropsInWindow++;	// creation is real work; count it in the burst window
+					if (namekeyCropLogged < 200)
+					{
+						namekeyCropLogged++;
+						char buf[300];
+						sprintf_s(buf, sizeof(buf), "[NAMEKEY] CROP key=\"%s\" %ux%u at=%ld,%ld -> serve=%ux%u hash=%016llX (synth=%lu texes=%lu)",
+							ckey, (unsigned)st.w, (unsigned)st.h, (long)nkPlace->a2, (long)nkPlace->a3,
+							serveW, serveH, (unsigned long long)ph, (unsigned long)namekeyCropSynth, (unsigned long)namekeyCropTexCreated);
+						Logging::Log() << buf;
+					}
+				}
+			}
+		}
+		const bool nkServeNow = (st.st == 1 && st.tex != nullptr);
+		IDirect3DTexture9* nkTex = st.tex;
+		const long nkx = nkPlace->a2, nky = nkPlace->a3, nkw = (long)st.w, nkh = (long)st.h;
+		namekeyCropByKey[ck] = std::move(st);
+		if (nkServeNow)
+		{
+			return NkServeCrop(nkTex, nkx, nky, nkw, nkh);
+		}
+		// fall through: legacy content crop (correct regardless of why we're here)
+	}
+
+	// First sight of this (surface, rect). Crop the exact texel rect DIRECTLY into a
+	// rect-sized MANAGED texture -- the SAME single GPU->MANAGED copy A.10 used and which
+	// never froze. NO SYSTEMMEM readback + LockRect here: that mid-scene VRAM->sysmem
+	// stall (added only to content-hash for cross-surface dedup) is what deadlocked
+	// against Remix. Dedup dropped -- identical content on two different surfaces now
+	// makes two sub-textures (minor memory, not correctness; each is still a clean
+	// single-region image). See dk2_universal_decompose_plan memory.
+	IDirect3DSurface9* srcLevel = nullptr;
+	if (FAILED(surface.Texture->GetSurfaceLevel(0, &srcLevel)) || !srcLevel) return false;
+
+	// POWER-OF-TWO destination (2026-05-21): Remix's server AV'd (0xC0000005, identical
+	// crash address both times) on NPOT rect-sized sub-textures -- a near-square 65x65
+	// crop squeaked by, but thin/extreme-aspect NPOT crops (41x52, 64x9) crash its
+	// geometry/mip path. A.10's canonical (always created at the atlas's POT size with
+	// the crop stretched to fill) NEVER crashed Remix in months. So size the sub-texture
+	// to per-dimension next-POT and STRETCH the cropped region into it. The draw's UVs
+	// are rewritten to [0,1] over the region (below), so the stretch is undone at sample
+	// time -- visually identical, but Remix sees a clean POT texture. The UV mapping is
+	// normalized so the POT size does not affect it. See dk2_universal_decompose_plan.
+	auto nextPOT = [](long v) -> UINT { UINT p = 8; while ((long)p < v) p <<= 1; return p; };
+	const UINT dstW = nextPOT(rw);
+	const UINT dstH = nextPOT(rh);
+
+	// MANAGED A8R8G8B8, full mip chain (levels=0). Without lower mips, far/small torches
+	// render as a solid white block under Remix.
+	IDirect3DTexture9* sub = nullptr;
+	HRESULT hr = (*d3d9Device)->CreateTexture(dstW, dstH, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &sub, nullptr);
+	if (FAILED(hr) || !sub) { srcLevel->Release(); return false; }
+
+	IDirect3DSurface9* dstLevel = nullptr;
+	if (FAILED(sub->GetSurfaceLevel(0, &dstLevel)) || !dstLevel)
+	{
+		sub->Release(); srcLevel->Release(); return false;
+	}
+
+	// Stretch the cropped texel rect to FILL the POT destination (no dstRect = whole
+	// surface). LINEAR resamples the rect up/down to the POT size.
+	RECT srcRect{ px0, py0, px1, py1 };
+	hr = D3DXLoadSurfaceFromSurface(dstLevel, nullptr, nullptr, srcLevel, nullptr, &srcRect, D3DX_FILTER_LINEAR, 0);
+	if (FAILED(hr))
+	{
+		dstLevel->Release(); sub->Release(); srcLevel->Release(); return false;
+	}
+
+	if (sub->GetLevelCount() > 1)
+		D3DXFilterTexture(sub, nullptr, 0, D3DX_FILTER_LINEAR);
+	univCropsTotal++;
+	g_globalRateCropsInWindow++;
+	stage3PerSurface[(void*)this].crops++;
+
+	// Per-surface streaming-buffer detection (Phase 4, periodic-recheck in Phase 6).
+	// Count crops per surface; at every kBlacklistWindowCrops checkpoint, compute the
+	// rate over the most recent window (NOT cumulative). If above threshold, blacklist.
+	// Re-checking periodically catches late-emerging streamers -- surfaces whose
+	// crop rate ramps up only during specific gameplay (late-game combat, mining, etc.)
+	// and which wouldn't trip a one-shot cumulative-rate check at crop #256.
+	// Logged on every blacklist event with the window stats.
+	static const DWORD kBlacklistWindowCrops = 256;
+	static const DWORD kBlacklistRateThresholdPerSec = 30;
+	surface.UnivCropCount++;
+	const DWORD nowMs = GetTickCount();
+	if (surface.UnivCheckpointStartMs == 0) surface.UnivCheckpointStartMs = nowMs;
+	if ((surface.UnivCropCount % kBlacklistWindowCrops) == 0)
+	{
+		const DWORD elapsedMs = nowMs - surface.UnivCheckpointStartMs;
+		if (elapsedMs > 0)
+		{
+			const DWORD ratePerSec = (kBlacklistWindowCrops * 1000) / elapsedMs;
+			if (ratePerSec > kBlacklistRateThresholdPerSec)
+			{
+				surface.UnivSkipDecompose = true;
+				char bbuf[220];
+				sprintf_s(bbuf, sizeof(bbuf), "[UNIV] BLACKLIST surface=%p totalCrops=%lu (window %lu in %lums -> %lu/s, threshold=%lu) -- streaming buffer, decompose disabled",
+					(void*)this, (unsigned long)surface.UnivCropCount,
+					(unsigned long)kBlacklistWindowCrops, (unsigned long)elapsedMs,
+					(unsigned long)ratePerSec, (unsigned long)kBlacklistRateThresholdPerSec);
+				Logging::Log() << bbuf;
+			}
+		}
+		// Start a new measurement window for this surface.
+		surface.UnivCheckpointStartMs = nowMs;
+	}
+
+	// Capture locks the MANAGED dst (sysmem-backed -> no GPU readback stall), unlike
+	// the removed SYSTEMMEM scratch lock. Same call A.10 used safely.
+	if (Config.DdrawContentCapture)
+		CaptureSurfaceContent(dstLevel, (void*)sub, /*isCrop=*/true);
+
+	{
+		char buf[300];
+		sprintf_s(buf, sizeof(buf), "[UNIV] synthesized atlas=%p rect=[%ld,%ld,%ld,%ld] %ldx%ld->%ux%u(POT) of %ux%u (binds=%lu crops=%lu cache=%zu/%zu evicts=%lu invals=%lu)",
+			(void*)this, px0, py0, px1, py1, rw, rh, dstW, dstH, atlasW, atlasH,
+			(unsigned long)univDecomposeBindsTotal, (unsigned long)univCropsTotal,
+			univDrawCache.size(), kUnivCacheCap, (unsigned long)univEvictTotal,
+			(unsigned long)univInvalidatesTotal);
+		Logging::Log() << buf;
+	}
+
+	dstLevel->Release();
+	srcLevel->Release();
+
+	// [NAMEKEY] DYNUI CROP (2026-06-11): the EXACT hash Remix sees for a dynamic-UI
+	// draw that fell to the legacy crop -- the pointer strips live here (no sidecar).
+	// This is the authoring list for rtx.uiTextures: tag these and the rasterized-UI
+	// path renders the hand in its original colors on top of the path-traced frame
+	// (the Desktop copy's persistent-hand mechanism, re-keyed to our pipeline).
+	if (g_namekeyDrawDynUiAny && namekeyDynUiCropLogLines < 60)
+	{
+		const uint64_t dh = Stage3HashD3d9Texture(sub);
+		if (dh && namekeyDynUiCropLogged.insert(dh).second)
+		{
+			namekeyDynUiCropLogLines++;
+			char dbuf[200];
+			sprintf_s(dbuf, sizeof(dbuf), "[NAMEKEY] DYNUI CROP hash=%016llX rect=[%ld,%ld,%ld,%ld] page=%ux%u",
+				(unsigned long long)dh, px0, py0, px1, py1, atlasW, atlasH);
+			Logging::Log() << dbuf;
+		}
+	}
+
+	// Cache this (surface, rect) -> sub-texture as most-recently-used. Record:
+	// - cachedAtRepurposeGen for the per-surface idle-then-Blt gate (Phase 5)
+	// - cachedAtTimeMs + px0/py0/px1/py1 pixel rect for the per-Blt overlap gate (Phase 7)
+	univLru.push_back(dkey);
+	auto lruIt = std::prev(univLru.end());
+	univDrawCache[dkey] = UnivSubTex{ sub, su0, sv0, su1, sv1, lruIt, surface.RepurposeGen,
+		px0, py0, px1, py1, GetTickCount() };
+
+	// Evict least-recently-used entries past the cap, freeing their MANAGED textures
+	// (the fix for the 32-bit OOM from unbounded map-churn crops). Torches stay (MRU).
+	while (univDrawCache.size() > kUnivCacheCap && !univLru.empty())
+	{
+		const UnivDrawKey oldKey = univLru.front();
+		univLru.pop_front();
+		auto oIt = univDrawCache.find(oldKey);
+		if (oIt != univDrawCache.end())
+		{
+			if (oIt->second.tex) oIt->second.tex->Release();
+			univDrawCache.erase(oIt);
+			univEvictTotal++;
+		}
+	}
+
+	subTexOut = sub;
+	regionU0Out = su0;
+	regionV0Out = sv0;
+	regionDuOut = su1 - su0;
+	regionDvOut = sv1 - sv0;
+	regionIdxOut = 0;
+	univDecomposeBindsTotal++;
+	return true;
+}
+
+// Phase 7 (2026-05-24): push a Blt dest rect into the surface's BltHistory ring buffer.
+// dirtyRect=nullptr means "whole surface" -> records (0,0,width,height). Called from the
+// success paths of Blt()/BltFast() (and could be called from any other code path that knows
+// it just modified content at a known region of the surface). The universal-decompose hit
+// gate uses this to invalidate per-rect when a cached entry's UV rect overlaps a recent Blt.
+void m_IDirectDrawSurfaceX::RecordBltRect(const RECT* dirtyRect)
+{
+	BltHistEntry& e = BltHistory[BltHistoryHead];
+	if (dirtyRect)
+	{
+		e.x0 = dirtyRect->left;
+		e.y0 = dirtyRect->top;
+		e.x1 = dirtyRect->right;
+		e.y1 = dirtyRect->bottom;
+	}
+	else
+	{
+		e.x0 = 0;
+		e.y0 = 0;
+		e.x1 = (LONG)surface.Width;
+		e.y1 = (LONG)surface.Height;
+	}
+	e.timeMs = GetTickCount();
+	BltHistoryHead = (BltHistoryHead + 1) % kBltHistorySize;
+}
+
+void m_IDirectDrawSurfaceX::SetDirtyFlag(DWORD MipMapLevel, const RECT* dirtyRect)
 {
 	if (MipMapLevel == 0)
 	{
@@ -6681,6 +9492,27 @@ void m_IDirectDrawSurfaceX::SetDirtyFlag(DWORD MipMapLevel)
 		surface.IsDirtyFlag = true;
 		surface.HasData = true;
 		surface.IsDrawTextureDirty = true;
+		// Per-Blt rect history (Phase 7, 2026-05-24): push the modified rect (or
+		// "whole surface" when dirtyRect == nullptr) into BltHistory ring buffer.
+		// The universal-decompose hit gate uses this to invalidate cache entries whose
+		// UV rect overlaps a Blt that occurred after the entry was cached. Catches the
+		// "continuously-Blt'd shared atlas" case where the per-surface RepurposeGen gate
+		// alone can't fire (no idle gap).
+		RecordBltRect(dirtyRect);
+		// Gap-based repurpose detection (Phase 5, 2026-05-24): bump RepurposeGen only
+		// when this Blt follows a long idle period. Animations Blt continuously (small
+		// gaps) -> no bump -> cached entries stay valid. Sprite repurposes follow seconds
+		// of idle -> gap > threshold -> bump -> cached entries for this surface invalidate
+		// on next bind, forcing a fresh crop. Skip the bump on the very first Blt (prev=0)
+		// because there are no cached entries yet to invalidate.
+		static const DWORD kRepurposeIdleGapMs = 1000;
+		const DWORD nowMs = GetTickCount();
+		const DWORD prevBltMs = surface.LastBltTimeMs;
+		surface.LastBltTimeMs = nowMs;
+		if (prevBltMs != 0 && (nowMs - prevBltMs) > kRepurposeIdleGapMs)
+		{
+			surface.RepurposeGen++;
+		}
 		IsMipMapReadyToUse = (IsMipMapAutogen() || MipMaps.empty());
 
 		// Update Uniqueness Value
@@ -6712,6 +9544,80 @@ void m_IDirectDrawSurfaceX::SetDirtyFlag(DWORD MipMapLevel)
 		if (Config.DdrawAtlasDecompose)
 		{
 			wrapperToFamilyIdx.erase((void*)this);
+		}
+
+		// [RECIPE] (2026-06-10): a mip-0 write NOT coming from our Blt path (Lock/
+		// direct CPU write) on a recipe-tracked surface. Count it so emitted recipes
+		// carry a direct=N caveat -- such content is partly invisible to Blt recording.
+		// recipeLastBltTex filters Blt's own SetDirtyFlag call, which arrives after
+		// ScopedFlagSet(IsInBlt) has already closed.
+		if (Config.DdrawRecipeLog && IsSurfaceTexture() && surface.Texture)
+		{
+			if (surface.Texture == recipeLastBltTex)
+			{
+				recipeLastBltTex = nullptr;
+			}
+			else if (!IsSurfaceBlitting())
+			{
+				auto rit = recipeByTex.find(surface.Texture);
+				if (rit != recipeByTex.end()) rit->second.directWrites++;
+
+				// [LOCKW] flush: the game's Lock write(s) just landed -- log the
+				// resulting staging content hash + every pending (eip, rect).
+				// UniquenessValue is already bumped here, so the hash below is the
+				// exact value the next Blt-out's srcHash cache will compute.
+				auto lw = lockWPending.find((void*)this);
+				if (lw != lockWPending.end() && !lw->second.empty())
+				{
+					const uint64_t hNow = Stage3HashD3d9Texture(surface.Texture);
+					char buf[128];
+					sprintf_s(buf, sizeof(buf), "[LOCKW] surf=%p hash=%016llX n=%zu writes=",
+						(void*)this, (unsigned long long)hNow, lw->second.size());
+					std::string line = buf;
+					for (const LockWPend& p : lw->second)
+					{
+						if (p.hasRect)
+						{
+							sprintf_s(buf, sizeof(buf), "%08lX:%ld,%ld,%ld,%ld|", (unsigned long)p.eip,
+								p.rect.left, p.rect.top, p.rect.right, p.rect.bottom);
+						}
+						else
+						{
+							sprintf_s(buf, sizeof(buf), "%08lX:FULL|", (unsigned long)p.eip);
+						}
+						line += buf;
+					}
+					Logging::Log() << line.c_str();
+					lw->second.clear();
+				}
+			}
+		}
+
+		// Canonical Identity Layer (2026-06-09): content changed -> the cached
+		// content hash and canonical resolution for this texture are stale. Erase
+		// both; the next bind rehashes + re-resolves against the NEW bytes. After
+		// kCanonChurnCap invalidations (animated/composited surfaces rewriting
+		// every frame), permanently exempt the texture: cache a null resolution so
+		// its binds stop paying lock+rehash entirely. The Stage 3 hash cache keeps
+		// its last value for exempted textures, preserving pre-existing stats
+		// behavior for hot writers.
+		if (Config.DdrawCanonicalRebind && IsSurfaceTexture() && surface.Texture)
+		{
+			DWORD& churn = canonChurnByTex[surface.Texture];
+			if (churn <= kCanonChurnCap)
+			{
+				churn++;
+				if (churn > kCanonChurnCap)
+				{
+					canonResolveByTex[surface.Texture] = nullptr;
+					canonChurnExemptTotal++;
+				}
+				else
+				{
+					stage3HashByD3d9Tex.erase(surface.Texture);
+					canonResolveByTex.erase(surface.Texture);
+				}
+			}
 		}
 	}
 	// Mark mipmap data flag

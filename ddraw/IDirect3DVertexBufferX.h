@@ -138,6 +138,12 @@ public:
 
 	DWORD GetFVF9() const { return d3d9VBDesc.FVF; };
 
+	// Menu-text fix (2026-06-12): CPU-side copy of the vertex data (kept current by
+	// Lock/Unlock). Lets the device reroute XYZRHW VB draws through the user-pointer
+	// draw path so they receive the XYZRHW->world conversion like every other draw.
+	const BYTE* GetCpuVertexData() const { return VertexData.data(); };
+	DWORD GetCpuVertexDataSize() const { return (DWORD)VertexData.size(); };
+
 	// Static functions
 	static bool InterleaveStridedVertexData(std::vector<BYTE, aligned_allocator<BYTE, 4>>& outputBuffer, const D3DDRAWPRIMITIVESTRIDEDDATA* sd, const DWORD dwVertexStart, const DWORD dwNumVertices, const DWORD dwVertexTypeDesc);
 	template <typename T>
