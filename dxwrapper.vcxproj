@@ -535,6 +535,8 @@ copy /Y "$(ProjectDir)License.txt" "$(TargetDir)Build\" &gt;nul</Command>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release_xp|Win32'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="ddraw\AddressLookupTable.cpp" />
+    <ClCompile Include="ddraw\HeapReplace.cpp" />
+    <ClCompile Include="ddraw\MenuRes.cpp" />
     <ClCompile Include="ddraw\ddraw.cpp" />
     <ClCompile Include="ddraw\IDirect3DDeviceX.cpp" />
     <ClCompile Include="ddraw\IDirect3DMaterialX.cpp" />
@@ -1174,6 +1176,8 @@ copy /Y "$(ProjectDir)License.txt" "$(TargetDir)Build\" &gt;nul</Command>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release_xp|Win32'">true</ExcludedFromBuild>
     </ClInclude>
     <ClInclude Include="ddraw\AddressLookupTable.h" />
+    <ClInclude Include="ddraw\HeapReplace.h" />
+    <ClInclude Include="ddraw\MenuRes.h" />
     <ClInclude Include="ddraw\ddraw.h" />
     <ClInclude Include="ddraw\ddrawExternal.h" />
     <ClInclude Include="ddraw\IDirect3DDeviceX.h" />
