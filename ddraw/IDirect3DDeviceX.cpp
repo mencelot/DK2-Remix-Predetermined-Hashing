@@ -17,6 +17,8 @@
 #include "ddraw.h"
 #include "d3d9\d3d9External.h"
 #include "RemixAPI.h"
+#include <unordered_map>		// [GEOMPROBE]
+#include <unordered_set>		// [GEOMPROBE]
 
 // Stage 3 measurement (2026-05-27): defined in IDirectDrawSurfaceX.cpp. Called on
 // every d3d9 SetTexture binding so we can aggregate per-hash bind counts and answer
@@ -3520,6 +3522,113 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 	}
 }
 
+// ===================== [GEOMPROBE] geometry identity stability probe (v3) =====================
+// Read-only. Does a DK2 draw carry a STABLE geometry identity a Remix mesh replacement could
+// bind to? Positions bake to screen each frame so they're excluded. v1 (topology+UV) exploded
+// because UVs index DK2's drifting runtime ATLASES. v2 (raw topology) STILL drifted (~71% of
+// topologies one-shot, 14k distinct (v,i) count-pairs) => DK2 submits mostly variable-size
+// per-frame BATCHES, with a recurring core (~284 meshes drawn 64+x). v3 adds two things:
+//   (1) NORMALIZED topology -- subtract the min index before hashing + use the vertex SPAN
+//       (max-min) not the buffer size, so the SAME mesh packed at different base offsets in a
+//       shared per-frame vertex buffer hashes the SAME. Rules out base-offset FALSE drift
+//       (the geometry analog of atlas-UV drift) that could be under-counting the bindable core.
+//   (2) a RECURRENCE HISTOGRAM (1x / 2-9x / 10-99x / 100+x) on the normalized id -- the 100+x
+//       bucket = the truly bindable core (creatures/props/repeat architecture), sized exactly.
+// rawTopoIds (v2's key) is kept as a count-only A/B: rawTopoIds >> normIds == base-offset was
+// splitting one mesh into many; normIds plateauing small == a real, bindable mesh set exists.
+namespace {
+	struct GeomProbeStat {
+		uint32_t i = 0, span = 0, seen = 0;
+		std::unordered_set<uint64_t> posSet;	// distinct baked-position hashes (capped)
+		bool posCapped = false;
+	};
+	std::unordered_map<uint64_t, GeomProbeStat> g_geomNorm;	// primary: keyed by NORMALIZED topology
+	std::unordered_set<uint64_t> g_geomRawSet;				// distinct raw topology ids -- A/B counter
+	std::unordered_set<uint64_t> g_geomFullSet;				// distinct (topology^UV) ids -- A/B counter
+	std::unordered_set<uint64_t> g_geomVISet;				// distinct (vcount,icount) pairs -- coarse floor
+	unsigned long long g_geomProbeDraws = 0;
+	unsigned long g_geomProbeNewLogged = 0;
+	bool g_ovfNorm = false, g_ovfRaw = false, g_ovfFull = false;
+	const size_t kNormMaxIds = 60000;		// backstop; a real bindable set is expected in the hundreds-low thousands
+	const size_t kSetMaxIds = 500000;		// A/B counter backstop
+	const size_t kGeomProbePosCap = 64;		// per-id distinct-position sample cap (>=2 is all we test)
+
+	inline uint64_t GeomFnv(const void* data, size_t len, uint64_t h = 1469598103934665603ULL) {
+		const uint8_t* p = (const uint8_t*)data;
+		for (size_t k = 0; k < len; k++) { h ^= p[k]; h *= 1099511628211ULL; }
+		return h;
+	}
+
+	// Called from DrawIndexedPrimitive under the DD critical section (map access is serialized).
+	void GeomProbeObserve(LPVOID lpVertices, DWORD dwVertexCount, LPWORD lpwIndices, DWORD dwIndexCount,
+		UINT stride, bool hasUv, UINT uvOff, float u0, float v0, float u1, float v1)
+	{
+		if (!lpVertices || !lpwIndices || dwVertexCount == 0 || dwIndexCount == 0) return;
+		g_geomProbeDraws++;
+
+		// Index range, to normalize away a shared-buffer base offset.
+		WORD imin = lpwIndices[0], imax = lpwIndices[0];
+		for (DWORD k = 1; k < dwIndexCount; k++) { WORD x = lpwIndices[k]; if (x < imin) imin = x; if (x > imax) imax = x; }
+		const uint32_t span = (uint32_t)(imax - imin) + 1;	// real vertices the mesh uses (base-invariant)
+
+		// NORMALIZED topology id: hash (index - imin) + icount + span. Base-offset invariant.
+		uint64_t normH = 1469598103934665603ULL;
+		for (DWORD k = 0; k < dwIndexCount; k++) { WORD d = (WORD)(lpwIndices[k] - imin); normH = GeomFnv(&d, sizeof(WORD), normH); }
+		const uint64_t normId = normH ^ ((uint64_t)span << 40) ^ ((uint64_t)dwIndexCount << 8);
+		// RAW topology id (v2 key): includes absolute index values + buffer vcount.
+		const uint64_t rawId = GeomFnv(lpwIndices, (size_t)dwIndexCount * sizeof(WORD))
+			^ ((uint64_t)dwVertexCount << 40) ^ ((uint64_t)dwIndexCount << 8);
+		// UV + position hashes (strided). Neither is in the identity -- UV only for the A/B count.
+		uint64_t uvH = 1469598103934665603ULL, posH = 1469598103934665603ULL;
+		const uint8_t* vb = (const uint8_t*)lpVertices;
+		for (UINT n = 0; n < dwVertexCount; n++) {
+			const uint8_t* vtx = vb + (size_t)n * stride;
+			posH = GeomFnv(vtx, 12, posH);					// xyz (skip RHW at +12)
+			if (hasUv) uvH = GeomFnv(vtx + uvOff, 8, uvH);	// u,v
+		}
+		// A/B counters.
+		if (g_geomRawSet.size() < kSetMaxIds) g_geomRawSet.insert(rawId); else g_ovfRaw = true;
+		if (g_geomFullSet.size() < kSetMaxIds) g_geomFullSet.insert(rawId ^ (uvH * 0x9E3779B97F4A7C15ULL)); else g_ovfFull = true;
+		g_geomVISet.insert(((uint64_t)dwVertexCount << 32) | dwIndexCount);
+
+		auto it = g_geomNorm.find(normId);
+		if (it == g_geomNorm.end()) {
+			if (g_geomNorm.size() >= kNormMaxIds) { g_ovfNorm = true; return; }
+			GeomProbeStat st; st.i = dwIndexCount; st.span = span; st.seen = 1;
+			st.posSet.insert(posH);
+			g_geomNorm.emplace(normId, std::move(st));
+			if (g_geomProbeNewLogged < 600) {
+				g_geomProbeNewLogged++;
+				char buf[200];
+				sprintf_s(buf, sizeof(buf), "[GEOMPROBE] NEW norm=%016llX span=%lu i=%lu uv=[%.4f,%.4f,%.4f,%.4f]",
+					(unsigned long long)normId, (unsigned long)span, (unsigned long)dwIndexCount, u0, v0, u1, v1);
+				Logging::Log() << buf;
+			}
+		} else {
+			GeomProbeStat& st = it->second;
+			st.seen++;
+			if (!st.posCapped) { if (st.posSet.size() < kGeomProbePosCap) st.posSet.insert(posH); else st.posCapped = true; }
+		}
+
+		// Summary every 10k draws. THE answer: normIds vs rawIds (base-offset?), normIds plateau?,
+		// and the recurrence histogram -- hist100 = the cleanly-bindable mesh core, sized exactly.
+		if ((g_geomProbeDraws % 10000ULL) == 0) {
+			size_t multiPos = 0, posCappedIds = 0, h1 = 0, h2 = 0, h10 = 0, h100 = 0;
+			for (auto& kv : g_geomNorm) {
+				const GeomProbeStat& s = kv.second;
+				if (s.posCapped || s.posSet.size() >= 2) multiPos++;
+				if (s.posCapped) posCappedIds++;
+				if (s.seen >= 100) h100++; else if (s.seen >= 10) h10++; else if (s.seen >= 2) h2++; else h1++;
+			}
+			char buf[360];
+			sprintf_s(buf, sizeof(buf), "[GEOMPROBE] SUMMARY draws=%llu normIds=%zu rawIds=%zu fullIds=%zu viPairs=%zu hist[1=%zu,2-9=%zu,10-99=%zu,100+=%zu] multiPosNorm=%zu posCapped=%zu ovf[N=%d,R=%d,F=%d]",
+				(unsigned long long)g_geomProbeDraws, g_geomNorm.size(), g_geomRawSet.size(), g_geomFullSet.size(), g_geomVISet.size(),
+				h1, h2, h10, h100, multiPos, posCappedIds, g_ovfNorm ? 1 : 0, g_ovfRaw ? 1 : 0, g_ovfFull ? 1 : 0);
+			Logging::Log() << buf;
+		}
+	}
+}
+// =========================================================================================
 
 
 HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWORD dwVertexTypeDesc, LPVOID lpVertices, DWORD dwVertexCount, LPWORD lpwIndices, DWORD dwIndexCount, DWORD dwFlags, DWORD DirectXVersion)
@@ -3643,6 +3752,13 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 				<< " tex=" << uiTexPtr
 				<< (has_uv ? (std::string(" uv=[") + std::to_string(u_min) + "," + std::to_string(v_min) + "," + std::to_string(u_max) + "," + std::to_string(v_max) + "]").c_str() : ""));
 
+			// [GEOMPROBE] read-only geometry-identity stability probe (flag-gated). Hash
+			// indices+UVs (position-independent) and track distinct position-sets per id.
+			if (Config.DdrawGeomProbe)
+			{
+				GeomProbeObserve(lpVertices, dwVertexCount, lpwIndices, dwIndexCount,
+					scanStride, has_uv, atlasDecomposeUVOffBase, u_min, v_min, u_max, v_max);
+			}
 
 			// Dynamic-UI emissive: clear the per-draw classification before the
 			// decompose probes (TryGetUniversalSubTextureForUV sets it).
