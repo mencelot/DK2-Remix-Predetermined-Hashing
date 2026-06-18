@@ -100,6 +100,7 @@ inline std::ostream& operator<<(std::ostream& os, const DHEX& dhex) {
 	visit(DdrawAtlasDecompose) \
 	visit(DdrawUniversalDecompose) \
 	visit(DdrawGeomProbe) \
+	visit(DdrawDrawCallerLog) \
 	visit(DdrawUseDirect3D9Caps) \
 	visit(DdrawUseShadowSurface) \
 	visit(DdrawUseNativeResolution) \
@@ -326,6 +327,7 @@ struct CONFIG
 	bool DdrawMenuBlitOverlay = false;			// [BLITQUAD] (2026-06-12, menu-text fix root cause): DK2's front end composites its UI -- ALL the menu text -- via 2D Blts straight onto the backbuffer (MENUDIAG run: 2013 backbuffer Blts/menu visit; color-keyed 79x38 sprite layers at screen coords). The path tracer discards the rasterized frame, so that UI can never appear. This queues a texture copy of every such Blt and re-emits them at EndScene as XYZRHW quads through the normal draw path, where the orphan-overlay lift makes them near-depth + additive (self-lit). Inert in-game (the game proper never Blts to the backbuffer mid-scene). Requires DdrawOrphanOverlayLift.
 	bool DdrawCollapseAnimationPools = false;	// Path B: detect per-instance animation pools (one source -> N dests) and redirect SetTexture to a canonical member to stabilize hashes for Remix replacement
 	bool DdrawAtlasDecompose = false;			// Phase A.10: split known k-in-1 atlases into per-region sub-textures at SetTexture time and rewrite drawcall UVs to [0,1] so Remix sees per-region content hashes
+	bool DdrawDrawCallerLog = false;			// [DRAWCALLER] (2026-06-18, RE): at DrawIndexedPrimitive, stack-scan for the GAME's return address (the caller in DKII.exe .text 0x401000-0x64D431) to find DK2's render/draw call sites. The LOD-selection routine sits just before these calls. Logs [DRAWCALLER] NEW/SUMMARY (distinct sites + icount/vcount ranges). Read-only.
 	bool DdrawGeomProbe = false;				// [GEOMPROBE] geometry identity stability probe (2026-06-16, read-only): at DrawIndexedPrimitive, hash the GAME-submitted index list + UVs + counts (topology & UVs are invariant across animation/position; only XYZ bakes per frame) into a position-independent geomId, and track per geomId how many DISTINCT position-sets it's drawn with. Decides whether DK2 geometry has a stable identity Remix replacements could bind to (the mesh analog of the texture name-key). Logs [GEOMPROBE] NEW / SUMMARY. Zero behavioral change; never rewrites geometry.
 	bool DdrawUniversalDecompose = false;		// Universal UV-region decompose (2026-05-21): for ANY drawcall whose stage-0 UV bbox is a proper sub-rectangle of its bound texture, crop that exact region into a content-hash-keyed sub-texture and rewrite UVs to [0,1]. No fingerprints/hardcoded hashes. General fix for world-texture-co-atlased-with-UI (DK2 torch white-flash). Separate from / mutually-exclusive with DdrawAtlasDecompose.
 	bool DdrawNoDrawBufferSysLock = false;		// Disables Draw CriticalSection and sets NOSYSLOCK on Index and Vertex Buffer locks

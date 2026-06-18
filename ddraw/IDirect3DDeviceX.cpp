@@ -19,6 +19,7 @@
 #include "RemixAPI.h"
 #include <unordered_map>		// [GEOMPROBE]
 #include <unordered_set>		// [GEOMPROBE]
+#include <intrin.h>			// [DRAWCALLER] _AddressOfReturnAddress
 
 // Stage 3 measurement (2026-05-27): defined in IDirectDrawSurfaceX.cpp. Called on
 // every d3d9 SetTexture binding so we can aggregate per-hash bind counts and answer
@@ -3630,6 +3631,50 @@ namespace {
 }
 // =========================================================================================
 
+// ===================== [DRAWCALLER] locate DK2's draw call sites (RE for the LOD routine) =====
+// The game's LOD selection runs immediately before it calls our DrawIndexedPrimitive. Manual
+// stack scan (FPO-proof, no frame pointers needed): the first stack dword that lands in DKII.exe
+// .text (0x401000-0x64D431) AND is immediately preceded by a CALL = the game's draw call site.
+// Disassemble backward from there to find LOD selection. Read-only.
+namespace {
+	std::unordered_map<DWORD, DWORD> g_drawCallers, g_dcIcMin, g_dcIcMax, g_dcVcMin, g_dcVcMax;
+	unsigned long long g_drawCallerN = 0;
+	unsigned long g_drawCallerNew = 0;
+	const DWORD kTextLo = 0x00401000, kTextHi = 0x0064D431;	// DKII.exe .text
+
+	inline DWORD GameDrawCaller() {
+		DWORD* sp = (DWORD*)_AddressOfReturnAddress();
+		for (int i = 0; i < 600; i++) {
+			DWORD a = sp[i];
+			if (a > kTextLo + 8 && a <= kTextHi) {
+				const BYTE* p = (const BYTE*)a;
+				if (p[-5] == 0xE8) return a;								// call rel32
+				if (p[-2] == 0xFF && ((p[-1] >> 3) & 7) == 2) return a;		// call reg / [reg]   (FF /2, 2-byte)
+				if (p[-3] == 0xFF && ((p[-2] >> 3) & 7) == 2) return a;		// call [reg+disp8]   (3-byte)
+				if (p[-6] == 0xFF && ((p[-5] >> 3) & 7) == 2) return a;		// call [reg+disp32]  (6-byte)
+			}
+		}
+		return 0;
+	}
+	void DrawCallerObserve(DWORD ic, DWORD vc) {
+		DWORD a = GameDrawCaller();
+		if (!a) return;
+		g_drawCallerN++;
+		auto it = g_drawCallers.find(a);
+		if (it == g_drawCallers.end()) {
+			g_drawCallers[a] = 1; g_dcIcMin[a] = ic; g_dcIcMax[a] = ic; g_dcVcMin[a] = vc; g_dcVcMax[a] = vc;
+			if (g_drawCallerNew < 300) { g_drawCallerNew++; char b[96]; sprintf_s(b, sizeof(b), "[DRAWCALLER] NEW site=%08lX ic=%lu vc=%lu", (unsigned long)a, (unsigned long)ic, (unsigned long)vc); Logging::Log() << b; }
+		} else {
+			it->second++;
+			if (ic < g_dcIcMin[a]) g_dcIcMin[a] = ic; if (ic > g_dcIcMax[a]) g_dcIcMax[a] = ic;
+			if (vc < g_dcVcMin[a]) g_dcVcMin[a] = vc; if (vc > g_dcVcMax[a]) g_dcVcMax[a] = vc;
+		}
+		if ((g_drawCallerN % 50000ULL) == 0) {
+			for (auto& kv : g_drawCallers) { char b[180]; sprintf_s(b, sizeof(b), "[DRAWCALLER] SUMMARY site=%08lX count=%lu ic=%lu-%lu vc=%lu-%lu", (unsigned long)kv.first, (unsigned long)kv.second, (unsigned long)g_dcIcMin[kv.first], (unsigned long)g_dcIcMax[kv.first], (unsigned long)g_dcVcMin[kv.first], (unsigned long)g_dcVcMax[kv.first]); Logging::Log() << b; }
+		}
+	}
+}
+// =============================================================================================
 
 HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWORD dwVertexTypeDesc, LPVOID lpVertices, DWORD dwVertexCount, LPWORD lpwIndices, DWORD dwIndexCount, DWORD dwFlags, DWORD DirectXVersion)
 {
@@ -3655,6 +3700,7 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 			return DDERR_INVALIDPARAMS;
 		}
 
+		if (Config.DdrawDrawCallerLog) DrawCallerObserve(dwIndexCount, dwVertexCount);
 
 		if (DirectXVersion == 2)
 		{
