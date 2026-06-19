@@ -2,10 +2,6 @@
 
 A modified [`dxwrapper`](https://github.com/elishacloud/dxwrapper) that bridges **Dungeon Keeper 2** (1999, DirectX 6) into **[NVIDIA RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix)** path tracing — and, more specifically, makes DK2's runtime-composed textures *replaceable* by giving them a **predetermined, stable hash** that can be authored against offline.
 
-As far as we know, DK2 is the only DirectX 6 title running on Remix. This repo is the wrapper that makes it possible. It's a hobby project and very much an experiment — please read it in that spirit.
-
-> First real-time path tracing on DK2: **2026-01-19**.
-
 ---
 
 ## Why this exists
