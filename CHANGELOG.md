@@ -17,7 +17,7 @@ than committed live (see the README note). Read top-to-bottom, it's the story of
 - Built a 7-layer decompose cache (LRU + skip-splice + streaming blacklist + per-Blt rect overlap + a global crops/sec scarcity gate with hysteresis — "Phase 8").
 - Cracked the `EngineTextures.dat/.dir` format and its YCbCr 8×8 DCT codec; built a near-bit-exact encoder.
 - Verified our XXH3 hashing is **byte-identical** to Remix's — the key that makes hashes computable offline.
-- Texture-replacement pipelines established (PBRify, then CHORD joint-PBR).
+- Texture-replacement pipeline established with **PBRify** (Kim2091) — the upscaling look that shipped.
 
 ## 2026-06-09 to 06-11 — The drift war
 

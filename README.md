@@ -25,7 +25,7 @@ The result: ~200k draws per session served by stable, offline-known identity —
 ## What works today
 
 - **Path-traced Dungeon Keeper 2** — real ray-traced global illumination, reflections, and emissive torch light on the original game.
-- **PBR texture replacement** at scale — every `EngineTextures` image re-authored (PBRify/CHORD pipelines), bound through the predetermined-hash layer so it actually sticks.
+- **PBR texture replacement** at scale — every `EngineTextures` image re-authored with the **PBRify** pipeline (the look that shipped), bound through the predetermined-hash layer so it actually sticks.
 - **Translucent, still water** — DK2's 32-frame animated water is frame-collapsed to one stable hash and swapped for a path-traced translucent material; the per-frame sine-wave geometry is flattened wrapper-side via a per-frame least-squares surface fit (DK2's screen-space verts are inverse-projected back to world space first).
 - **Responsive lighting** — moved/extinguished lights update near-instantly (Remix's default keeps stale lights ~100 frames).
 - **Readable UI in the dark**, a visible Hand of Evil cursor, and an optional **high-resolution front-end menu** (2560×1600+).
@@ -66,7 +66,7 @@ Standing entirely on other people's shoulders:
 - **[dkollmann/dxwrapper](https://github.com/dkollmann/dxwrapper)** — the RTX-Remix-oriented fork this branched from.
 - **[NVIDIA RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix)** — the path tracer doing the actual heavy lifting.
 - **[Trass3r's GameTools](https://github.com/Trass3r/GameTools)** and **[OpenKeeper](https://github.com/tonihele/OpenKeeper)** — for reverse-engineered knowledge of DK2's formats (WAD, KMF, the codec, and the hard truths about LOD and vertex animation). Trass3r in particular has been generous with straight, expert answers.
-- The **PBRify** and **CHORD** communities for the texture-upscaling pipelines.
+- **[Kim2091](https://github.com/Kim2091)** and the **PBRify** project — the texture-upscaling pipeline behind the best-looking results here. PBRify is what shipped.
 
 ## License
 
